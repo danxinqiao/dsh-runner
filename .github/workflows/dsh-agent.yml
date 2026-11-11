@@ -1,12 +1,12 @@
 name: DSH Web with Public Runner & Private Storage
 
 on:
-  workflow_dispatch: # 仅手动触发，按需使用
+  workflow_dispatch:
 
 jobs:
   run-dsh-web:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # 留出余量，避免触及 GitHub 6小时硬限制
+    timeout-minutes: 350
 
     steps:
       - name: Checkout public runner repo
@@ -24,6 +24,10 @@ jobs:
         with:
           node-version: '24'
 
+      # 关键修复：安装 pnpm，供 dsh plugin 命令调用
+      - name: Install pnpm
+        run: npm install -g pnpm
+
       - name: Install DSH and cloudflared
         run: |
           npm install -g @deepseek-ai/dsh@alpha
@@ -33,7 +37,6 @@ jobs:
       - name: Install DSH web auth plugin
         run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
 
-      # 【恢复】将私有仓库中的 .dsh 数据复制到运行环境
       - name: Restore DSH data from private repository
         run: |
           if [ -d "./private-data/dsh-data" ]; then
@@ -44,7 +47,6 @@ jobs:
             echo "No previous DSH data found. Starting fresh."
           fi
 
-      # 启动 DSH Web，不注入 DEEPSEEK_API_KEY
       - name: Start DSH Web
         run: |
           nohup dsh web > dsh-web.log 2>&1 &
@@ -58,7 +60,6 @@ jobs:
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
-      # 启动 Cloudflare Quick Tunnel，生成临时公网链接
       - name: Start Cloudflare Tunnel
         run: |
           nohup ./cloudflared tunnel --url http://127.0.0.1:3080 --protocol http2 > tunnel.log 2>&1 &
@@ -76,13 +77,11 @@ jobs:
             cat tunnel.log
           fi
 
-      # 保持作业运行，直到手动取消或超时
       - name: Keep alive
         run: |
           echo "DSH Web and tunnel are running. Cancel workflow when done."
           while true; do sleep 300; done
 
-      # 【备份】将 ~/.dsh 同步回私有仓库并推送
       - name: Backup DSH data to private repository
         if: always()
         run: |
