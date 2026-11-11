@@ -1,12 +1,15 @@
-name: DSH Web with Public Runner & Private Storage
+name: DSH Web with Named Tunnel
 
 on:
-  workflow_dispatch: # 仅手动触发，按需使用
+  workflow_dispatch:
+
+env:
+  CUSTOM_DOMAIN: "https://dsh.gvegt614.top" # 你的固定域名
 
 jobs:
   run-dsh-web:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # 留出余量，避免触及 GitHub 6小时硬限制
+    timeout-minutes: 350
 
     steps:
       - name: Checkout public runner repo
@@ -36,11 +39,6 @@ jobs:
       - name: Install DSH web auth plugin
         run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
 
-      # 新增：安装跳过浏览器认证的插件
-      - name: Install DSH skip browser auth plugin
-        run: dsh plugin --profile web add @iasiv5/dsh-skip-browser-auth
-
-      # 【恢复】将私有仓库中的 .dsh 数据复制到运行环境
       - name: Restore DSH data from private repository
         run: |
           if [ -d "./private-data/dsh-data" ]; then
@@ -51,22 +49,33 @@ jobs:
             echo "No previous DSH data found. Starting fresh."
           fi
 
-      # 【关键修复】修正从仓库恢复的敏感文件权限，防止 DSH 因 assertOwnerOnly 报错拒绝启动
       - name: Fix DSH data permissions
         run: |
-          echo "Tightening permissions on DSH credential files..."
           chmod 700 ~/.dsh
           if [ -f ~/.dsh/.credentials.yaml ]; then
             chmod 600 ~/.dsh/.credentials.yaml
             echo "✅ ~/.dsh/.credentials.yaml permission set to 600."
-          else
-            echo "ℹ️ ~/.dsh/.credentials.yaml not found, skipping."
           fi
+
+      # 启动 Named Tunnel
+      - name: Start Cloudflare Named Tunnel
+        run: |
+          nohup ./cloudflared tunnel --no-autoupdate run --token ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
+          echo "Waiting for Named Tunnel to connect..."
+          for i in $(seq 1 30); do
+            if grep -q "Registered tunnel connection" tunnel.log; then
+              echo "✅ Named Tunnel connected."
+              break
+            fi
+            sleep 1
+          done
+          tail -n 20 tunnel.log
 
       # 启动 DSH Web
       - name: Start DSH Web
         run: |
-          setsid dsh web > dsh-web.log 2>&1 < /dev/null &
+          PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
+          setsid dsh web --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
           echo "Waiting for DSH Web on port 3080..."
           sleep 15
           if curl -s http://127.0.0.1:3080 > /dev/null; then
@@ -78,52 +87,20 @@ jobs:
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
-      # 启动 Cloudflare Quick Tunnel
-      - name: Start Cloudflare Tunnel
-        run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:3080 --protocol http2 > tunnel.log 2>&1 &
-          echo "Waiting for public URL..."
-          
-          URL=""
-          for i in $(seq 1 60); do
-            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then
-              echo "✅ 成功获取公网链接: $URL"
-              echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
-              break
-            fi
-            sleep 1
-          done
-          
-          if [ -z "$URL" ]; then
-            echo "⚠️ 未获取到链接，请查看下方完整日志："
-            cat tunnel.log
-          fi
-
-      # 保持作业运行，并实时打印链接和状态
       - name: Keep alive
         run: |
-          echo "DSH Web 和隧道正在运行。要停止，请手动点击 'Cancel workflow'。"
-          echo "=================================================="
-          if [ -n "$PUBLIC_URL" ]; then
-            echo "你的 DSH Web 访问链接是: $PUBLIC_URL"
-          fi
-          echo "=================================================="
-          
-          while true; do 
+          echo "DSH Web and tunnel are running. Cancel workflow when done."
+          echo "访问地址: ${{ env.CUSTOM_DOMAIN }}"
+          while true; do
             sleep 30
-            echo "--- 隧道最新状态 $(date -u) ---"
-            tail -n 5 tunnel.log
-            echo "--- DSH Web 进程状态 ---"
             if pgrep -f "dsh web" > /dev/null; then
               echo "✅ DSH Web 进程正在运行。"
             else
-              echo "❌ DSH Web 进程已退出！以下是退出前的日志片段："
+              echo "❌ DSH Web 进程已退出！"
               tail -n 20 dsh-web.log
             fi
           done
 
-      # 【备份】将 ~/.dsh 同步回私有仓库并推送
       - name: Backup DSH data to private repository
         if: always()
         run: |
