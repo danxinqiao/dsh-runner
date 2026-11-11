@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  CUSTOM_DOMAIN: "https://dsh.gyegt614.top" # 你的固定域名
+  CUSTOM_DOMAIN: "https://dsh.gyegt614.top"
 
 jobs:
   run-dsh-web:
@@ -39,6 +39,10 @@ jobs:
       - name: Install DSH web auth plugin
         run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
 
+      # 新增：安装 dsh-shutup 插件
+      - name: Install DSH skip-auth plugin (dsh-shutup)
+        run: dsh plugin --profile web add github:link-fgfgui/dsh-shutup
+
       - name: Restore DSH data from private repository
         run: |
           if [ -d "./private-data/dsh-data" ]; then
@@ -57,7 +61,6 @@ jobs:
             echo "✅ ~/.dsh/.credentials.yaml permission set to 600."
           fi
 
-      # 启动 Named Tunnel
       - name: Start Cloudflare Named Tunnel
         run: |
           nohup ./cloudflared tunnel --no-autoupdate run --token ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
@@ -71,11 +74,11 @@ jobs:
           done
           tail -n 20 tunnel.log
 
-      # 启动 DSH Web
       - name: Start DSH Web
         run: |
           PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
-          setsid dsh web --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
+          # 加入 --no-open 参数
+          setsid dsh web --no-open --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
           echo "Waiting for DSH Web on port 3080..."
           sleep 15
           if curl -s http://127.0.0.1:3080 > /dev/null; then
