@@ -10,10 +10,10 @@ jobs:
 
     steps:
       - name: Checkout public runner repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout private data repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ secrets.PRIVATE_DATA_REPO }}
           token: ${{ secrets.PRIVATE_DATA_REPO_PAT }}
@@ -22,17 +22,16 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Install DSH and cloudflared
         run: |
           npm install -g @deepseek-ai/dsh@alpha
-          curl -sL -o cloudflared.tgz "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz"
-          tar -xzf cloudflared.tgz
+          curl -sL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
 
       - name: Install DSH web auth plugin
-        run: dsh plugin --profile web add @fonlan/dsh-web-auth
+        run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
 
       # 【恢复】将私有仓库中的 .dsh 数据复制到运行环境
       - name: Restore DSH data from private repository
