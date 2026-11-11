@@ -1,0 +1,61 @@
+name: DSH Agent (Public Runner, Private Storage)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-dsh:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 签出公开运行仓库本身（获取工作流上下文）
+      - name: Checkout public runner repo
+        uses: actions/checkout@v4
+
+      # 2. 签出私有数据仓库到独立目录，用于恢复和备份
+      - name: Checkout private data repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'danxinqiao/dsh-backup' # 替换为实际的 owner/repo
+          token: ${{ secrets.PRIVATE_DATA_REPO_PAT }}
+          path: 'private-data' # 将私有仓库内容放在子目录中，避免与公开仓库冲突
+
+      # 3. 安装 Node.js 和 DSH (同上)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install DSH
+        run: npm install -g @deepseek-ai/dsh
+
+      # 4. 【恢复】从 private-data 目录复制到 ~/.dsh
+      - name: Restore DSH data
+        run: |
+          if [ -d "./private-data/dsh-data" ]; then
+            mkdir -p ~/.dsh
+            rsync -a --delete ./private-data/dsh-data/ ~/.dsh/
+          fi
+
+      # 5. 运行 DSH Agent 任务 (同上)
+      - name: Run DSH agent task
+        run: |
+          echo "DSH agent task starting..."
+          # dsh run "你的任务指令"
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+
+      # 6. 【备份】将 ~/.dsh 同步回 private-data 目录，并推送到私有仓库
+      - name: Backup DSH data to private repository
+        if: always()
+        run: |
+          if [ -d ~/.dsh ]; then
+            mkdir -p ./private-data/dsh-data
+            rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
+            cd private-data
+            git config user.name "DSH Agent (Public Runner)"
+            git config user.email "dsh-agent@users.noreply.github.com"
+            git add ./dsh-data
+            git diff --staged --quiet || git commit -m "Backup from public runner $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+          fi
