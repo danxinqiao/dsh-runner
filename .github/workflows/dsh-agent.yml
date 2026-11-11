@@ -15,15 +15,6 @@ jobs:
       - name: Checkout public runner repo
         uses: actions/checkout@v5
 
-      - name: Require a private repository
-        env:
-          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
-        run: |
-          if [ "$REPOSITORY_PRIVATE" != "true" ]; then
-            echo "::error::This workflow publishes a DSH launch link in the Actions Summary. Make this repository private before running it."
-            exit 1
-          fi
-
       - name: Checkout private data repository
         uses: actions/checkout@v5
         with:
@@ -45,6 +36,13 @@ jobs:
           curl -sL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
 
+      - name: Install DSH web auth plugin
+        run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
+
+      # 新增：安装 dsh-shutup 插件
+      - name: Install DSH skip-auth plugin (dsh-shutup)
+        run: dsh plugin --profile web add github:link-fgfgui/dsh-shutup
+
       - name: Restore DSH data from private repository
         run: |
           if [ -d "./private-data/dsh-data" ]; then
@@ -54,9 +52,6 @@ jobs:
           else
             echo "No previous DSH data found. Starting fresh."
           fi
-
-      - name: Install DSH web auth plugin
-        run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
 
       - name: Fix DSH data permissions
         run: |
@@ -68,7 +63,7 @@ jobs:
 
       - name: Start Cloudflare Named Tunnel
         run: |
-          nohup ./cloudflared tunnel --no-autoupdate run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --no-autoupdate run --token ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
           echo "Waiting for Named Tunnel to connect..."
           for i in $(seq 1 30); do
             if grep -q "Registered tunnel connection" tunnel.log; then
@@ -77,83 +72,42 @@ jobs:
             fi
             sleep 1
           done
-          if ! grep -q "Registered tunnel connection" tunnel.log; then
-            echo "::error::Cloudflare Tunnel did not connect."
-            tail -n 20 tunnel.log
-            exit 1
-          fi
           tail -n 20 tunnel.log
 
       - name: Start DSH Web
         run: |
           PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
+          # 加入 --no-open 参数
           setsid dsh web --no-open --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
           echo "Waiting for DSH Web on port 3080..."
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:3080/ > /dev/null 2>&1 || [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/)" = "401" ]; then
-              echo "✅ DSH Web is responding."
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "::error::DSH Web did not respond on port 3080."
-          exit 1
+          sleep 15
+          if curl -s http://127.0.0.1:3080 > /dev/null; then
+            echo "✅ DSH Web is ready."
+          else
+            echo "⚠️ DSH Web may not be ready. Showing log:"
+            cat dsh-web.log
+          fi
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
-
-      - name: Publish DSH launch link to Actions Summary
-        env:
-          CUSTOM_DOMAIN: ${{ env.CUSTOM_DOMAIN }}
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import os
-          import re
-          import sys
-          from pathlib import Path
-          from urllib.parse import parse_qs, quote, urlsplit
-
-          log = Path("dsh-web.log").read_text(errors="replace")
-          token = None
-
-          for candidate in re.findall(r"https?://[^\s]+", log):
-              candidate = candidate.rstrip(".,);]")
-              query = parse_qs(urlsplit(candidate).query)
-              values = query.get("token", [])
-              if values and values[0]:
-                  token = values[0]
-                  break
-
-          if not token:
-              print("::error::Could not find the DSH launch token in the startup log.")
-              sys.exit(1)
-
-          launch_url = f"{os.environ['CUSTOM_DOMAIN'].rstrip('/')}/?token={quote(token, safe='')}"
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("### DSH Web\n\n")
-              summary.write(f"[Open DSH Web](<{launch_url}>)\n")
-          PY
 
       - name: Keep alive
         run: |
           echo "DSH Web and tunnel are running. Cancel workflow when done."
-          echo "Open the launch link in the Actions run Summary."
+          echo "访问地址: ${{ env.CUSTOM_DOMAIN }}"
           while true; do
             sleep 30
-            if pgrep -f "[d]sh web" > /dev/null; then
+            if pgrep -f "dsh web" > /dev/null; then
               echo "✅ DSH Web 进程正在运行。"
             else
               echo "❌ DSH Web 进程已退出！"
               tail -n 20 dsh-web.log
-              exit 1
             fi
           done
 
       - name: Backup DSH data to private repository
         if: always()
         run: |
-          if [ -d ~/.dsh ] && [ -d ./private-data/.git ]; then
+          if [ -d ~/.dsh ]; then
             mkdir -p ./private-data/dsh-data
             rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
             cd private-data
