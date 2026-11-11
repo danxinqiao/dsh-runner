@@ -36,6 +36,10 @@ jobs:
       - name: Install DSH web auth plugin
         run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
 
+      # 新增：安装跳过浏览器认证的插件
+      - name: Install DSH skip browser auth plugin
+        run: dsh plugin --profile web add @iasiv5/dsh-skip-browser-auth
+
       # 【恢复】将私有仓库中的 .dsh 数据复制到运行环境
       - name: Restore DSH data from private repository
         run: |
@@ -59,7 +63,7 @@ jobs:
             echo "ℹ️ ~/.dsh/.credentials.yaml not found, skipping."
           fi
 
-      # 启动 DSH Web，使用 setsid 避免进程随 Shell 退出而终止
+      # 启动 DSH Web
       - name: Start DSH Web
         run: |
           setsid dsh web > dsh-web.log 2>&1 < /dev/null &
@@ -74,7 +78,7 @@ jobs:
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
-      # 启动 Cloudflare Quick Tunnel，并精准抓取链接
+      # 启动 Cloudflare Quick Tunnel
       - name: Start Cloudflare Tunnel
         run: |
           nohup ./cloudflared tunnel --url http://127.0.0.1:3080 --protocol http2 > tunnel.log 2>&1 &
@@ -82,7 +86,6 @@ jobs:
           
           URL=""
           for i in $(seq 1 60); do
-            # 必须匹配完整的 https://xxx.trycloudflare.com 才算成功
             URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then
               echo "✅ 成功获取公网链接: $URL"
