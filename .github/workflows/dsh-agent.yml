@@ -1,51 +1,89 @@
-name: DSH Agent (Public Runner, Private Storage)
+name: DSH Web with Public Runner & Private Storage
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # 仅手动触发，按需使用
 
 jobs:
-  run-dsh:
+  run-dsh-web:
     runs-on: ubuntu-latest
+    timeout-minutes: 350 # 留出余量，避免触及 GitHub 6小时硬限制
+
     steps:
-      # 1. 签出公开运行仓库本身（获取工作流上下文）
       - name: Checkout public runner repo
         uses: actions/checkout@v4
 
-      # 2. 签出私有数据仓库到独立目录，用于恢复和备份
       - name: Checkout private data repository
         uses: actions/checkout@v4
         with:
-          repository: 'danxinqiao/dsh-backup' # 替换为实际的 owner/repo
+          repository: ${{ secrets.PRIVATE_DATA_REPO }}
           token: ${{ secrets.PRIVATE_DATA_REPO_PAT }}
-          path: 'private-data' # 将私有仓库内容放在子目录中，避免与公开仓库冲突
+          path: 'private-data'
 
-      # 3. 安装 Node.js 和 DSH (同上)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install DSH
-        run: npm install -g @deepseek-ai/dsh
 
-      # 4. 【恢复】从 private-data 目录复制到 ~/.dsh
-      - name: Restore DSH data
+      - name: Install DSH and cloudflared
+        run: |
+          npm install -g @deepseek-ai/dsh
+          curl -sL -o cloudflared.tgz "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz"
+          tar -xzf cloudflared.tgz
+          chmod +x cloudflared
+
+      - name: Install DSH web auth plugin
+        run: dsh plugin --profile web add @fonlan/dsh-web-auth
+
+      # 【恢复】将私有仓库中的 .dsh 数据复制到运行环境
+      - name: Restore DSH data from private repository
         run: |
           if [ -d "./private-data/dsh-data" ]; then
             mkdir -p ~/.dsh
             rsync -a --delete ./private-data/dsh-data/ ~/.dsh/
+            echo "DSH data restored."
+          else
+            echo "No previous DSH data found. Starting fresh."
           fi
 
-      # 5. 运行 DSH Agent 任务 (同上)
-      - name: Run DSH agent task
+      # 启动 DSH Web，不注入 DEEPSEEK_API_KEY
+      - name: Start DSH Web
         run: |
-          echo "DSH agent task starting..."
-          # dsh run "你的任务指令"
+          nohup dsh web > dsh-web.log 2>&1 &
+          echo "Waiting for DSH Web on port 3080..."
+          sleep 15
+          if curl -s http://127.0.0.1:3080 > /dev/null; then
+            echo "✅ DSH Web is ready."
+          else
+            echo "⚠️ DSH Web may not be ready. Continuing anyway."
+          fi
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
-      # 6. 【备份】将 ~/.dsh 同步回 private-data 目录，并推送到私有仓库
+      # 启动 Cloudflare Quick Tunnel，生成临时公网链接
+      - name: Start Cloudflare Tunnel
+        run: |
+          nohup ./cloudflared tunnel --url http://127.0.0.1:3080 --protocol http2 > tunnel.log 2>&1 &
+          echo "Waiting for public URL..."
+          for i in $(seq 1 60); do
+            if grep -q "trycloudflare.com" tunnel.log 2>/dev/null; then
+              echo "✅ Public URL:"
+              grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -1
+              break
+            fi
+            sleep 1
+          done
+          if ! grep -q "trycloudflare.com" tunnel.log 2>/dev/null; then
+            echo "⚠️ Could not extract URL. Check tunnel.log below."
+            cat tunnel.log
+          fi
+
+      # 保持作业运行，直到手动取消或超时
+      - name: Keep alive
+        run: |
+          echo "DSH Web and tunnel are running. Cancel workflow when done."
+          while true; do sleep 300; done
+
+      # 【备份】将 ~/.dsh 同步回私有仓库并推送
       - name: Backup DSH data to private repository
         if: always()
         run: |
