@@ -26,7 +26,7 @@ jobs:
 
       - name: Install DSH and cloudflared
         run: |
-          npm install -g @deepseek-ai/dsh
+          npm install -g @deepseek-ai/dsh@alpha
           curl -sL -o cloudflared.tgz "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz"
           tar -xzf cloudflared.tgz
           chmod +x cloudflared
