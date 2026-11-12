@@ -65,7 +65,6 @@ jobs:
             fi
             sleep 1
           done
-          tail -n 10 tunnel.log
 
       - name: Start DSH Web
         run: |
@@ -83,32 +82,25 @@ jobs:
             echo "⚠️ DSH Web may not be ready."
           fi
 
-          # 使用更宽泛的正则，兼容 localhost、0.0.0.0 以及带有 - 和 _ 的 token
-          echo "正在尝试提取 Token..."
+          # 提取 Token URL
           RAW_TOKEN_URL=$(grep -oE 'https?://[^ ]+token=[a-zA-Z0-9_\-]+' dsh-web.log | head -1)
           
           if [ -n "$RAW_TOKEN_URL" ]; then
-            # 提取纯净的 token 字符串
             TOKEN_STR=$(echo "$RAW_TOKEN_URL" | sed -E 's/.*token=([a-zA-Z0-9_\-]+).*/\1/')
-            
-            # 统一拼接为你的公网域名
             TOKEN_URL="https://${PUBLIC_HOST}/?token=${TOKEN_STR}"
             
-            # 【关键】将完整 URL 和 Token 加入 GitHub 脱敏列表
             echo "::add-mask::$TOKEN_STR"
             echo "::add-mask::$TOKEN_URL"
             
             echo "TOKEN_URL=$TOKEN_URL" >> $GITHUB_ENV
             echo "✅ 成功提取访问地址，并已开启自动掩码保护。"
           else
-            echo "⚠️ 未在日志中直接找到带 token 的 URL。下面是脱敏后的日志供排查："
-            # 将打印出来的日志里的 token 强制打码
-            sed -E 's/token=[a-zA-Z0-9_\-]+/token=***/g' dsh-web.log | head -n 50
+            echo "⚠️ 未在日志中直接找到带 token 的 URL。"
           fi
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
-      # 推送到微信接口
+      # 推送到微信接口（带详细核对日志）
       - name: Push URL to WX API
         if: env.TOKEN_URL != ''
         continue-on-error: true 
@@ -119,11 +111,21 @@ jobs:
           TS=$(date +%s)
           NONCE=$RANDOM
           
-          # 按照微信官方规则计算签名 (字典序排序 -> 拼接 -> SHA1)
-          SIG=$(printf '%s\n' "$TOKEN" "$TS" "$NONCE" | sort | tr -d '\n' | sha1sum | cut -d' ' -f1)
-          echo "::add-mask::$SIG"
+          echo "--- 签名参数核对 ---"
+          echo "Timestamp: $TS"
+          echo "Nonce: $NONCE"
+          
+          # 【关键优化】强制使用 ASCII 字典序排序 (LC_ALL=C)，防止系统 locale 差异导致排序结果不同
+          SORT_STR=$(printf "%s\n%s\n%s" "$TOKEN" "$TS" "$NONCE" | LC_ALL=C sort | tr -d "\n")
+          
+          # 为了安全，将排序后的字符串加入脱敏（如果你想看它具体是什么，可以暂时注释掉下面这行，对比完再删）
+          # echo "::add-mask::$SORT_STR" 
+          echo "待计算 SHA1 的拼接字符串: $SORT_STR"
+          
+          SIG=$(echo -n "$SORT_STR" | sha1sum | awk '{print $1}')
+          echo "生成签名: $SIG"
+          echo "--------------------"
 
-          # 构造 XML 报文（将环境变量 TOKEN_URL 填入 Content）
           XML_DATA="<xml>
             <ToUserName><![CDATA[gh_test]]></ToUserName>
             <FromUserName><![CDATA[oUPTI2yAIBpKK_YkxHttqSc7TYiw]]></FromUserName>
@@ -132,42 +134,18 @@ jobs:
             <Content><![CDATA[202 ${{ env.TOKEN_URL }}]]></Content>
           </xml>"
           
-          # 发送 POST 请求（注意 URL 中的变量替换）
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-            "${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE" \
+          echo "=== 开始发送请求 ==="
+          # 打印真实发出的 URL（不包含脱敏）
+          REQ_URL="${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE"
+          echo "请求 URL: $REQ_URL"
+          
+          HTTP_STATUS=$(curl -s -w "%{http_code}" -o response.txt -X POST \
+            "$REQ_URL" \
             -H 'Content-Type: text/xml' \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)' \
             --data-binary "$XML_DATA")
             
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-            echo "✅ 微信推送成功 (HTTP $HTTP_STATUS)"
-          else
-            echo "⚠️ 微信推送失败 (HTTP $HTTP_STATUS)"
-          fi
-
-      - name: Keep alive
-        run: |
-          echo "DSH Web 正在运行。"
-          echo "✅ 访问链接及 Token 已尝试推送至微信，请在微信中查收（为保护隐私，日志中不予显示）。"
-          
-          while true; do 
-            sleep 30
-            if ! pgrep -f "dsh web" > /dev/null; then
-              echo "❌ DSH Web 进程已退出！以下是打码后的日志："
-              sed -E 's/token=[a-zA-Z0-9_\-]+/token=***/g' dsh-web.log | tail -n 20
-              exit 1
-            fi
-          done
-
-      - name: Backup DSH data to private repository
-        if: always()
-        run: |
-          if [ -d ~/.dsh ]; then
-            mkdir -p ./private-data/dsh-data
-            rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
-            cd private-data
-            git config user.name "DSH Agent"
-            git config user.email "dsh-agent@users.noreply.github.com"
-            git add ./dsh-data
-            git diff --staged --quiet || git commit -m "Backup from public runner $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
-          fi
+          echo "HTTP 状态码: $HTTP_STATUS"
+          echo "======== 响应内容 ========"
+          cat response.txt
+          echo -e "\n=========================="
