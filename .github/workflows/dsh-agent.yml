@@ -100,7 +100,6 @@ jobs:
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
-      # 推送到微信接口（带详细核对日志）
       - name: Push URL to WX API
         if: env.TOKEN_URL != ''
         continue-on-error: true 
@@ -115,11 +114,8 @@ jobs:
           echo "Timestamp: $TS"
           echo "Nonce: $NONCE"
           
-          # 【关键优化】强制使用 ASCII 字典序排序 (LC_ALL=C)，防止系统 locale 差异导致排序结果不同
+          # 强制使用 ASCII 字典序排序
           SORT_STR=$(printf "%s\n%s\n%s" "$TOKEN" "$TS" "$NONCE" | LC_ALL=C sort | tr -d "\n")
-          
-          # 为了安全，将排序后的字符串加入脱敏（如果你想看它具体是什么，可以暂时注释掉下面这行，对比完再删）
-          # echo "::add-mask::$SORT_STR" 
           echo "待计算 SHA1 的拼接字符串: $SORT_STR"
           
           SIG=$(echo -n "$SORT_STR" | sha1sum | awk '{print $1}')
@@ -135,17 +131,51 @@ jobs:
           </xml>"
           
           echo "=== 开始发送请求 ==="
-          # 打印真实发出的 URL（不包含脱敏）
           REQ_URL="${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE"
-          echo "请求 URL: $REQ_URL"
+          echo "原始请求 URL: $REQ_URL"
           
-          HTTP_STATUS=$(curl -s -w "%{http_code}" -o response.txt -X POST \
+          # 加入 -L 跟随重定向，--post301 --post302 确保重定向后依然使用 POST 方法
+          HTTP_STATUS=$(curl -L --post301 --post302 -s -w "%{http_code}" -o response.txt -X POST \
             "$REQ_URL" \
             -H 'Content-Type: text/xml' \
             -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)' \
             --data-binary "$XML_DATA")
             
-          echo "HTTP 状态码: $HTTP_STATUS"
+          echo "最终 HTTP 状态码: $HTTP_STATUS"
           echo "======== 响应内容 ========"
           cat response.txt
           echo -e "\n=========================="
+          
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ 微信推送成功"
+          else
+            echo "⚠️ 微信推送失败"
+          fi
+
+      - name: Keep alive
+        run: |
+          echo "DSH Web 正在运行。"
+          echo "✅ 访问链接及 Token 已尝试推送至微信，请在微信中查收（为保护隐私，日志中不予显示）。"
+          
+          while true; do 
+            sleep 30
+            if ! pgrep -f "dsh web" > /dev/null; then
+              echo "❌ DSH Web 进程已退出！以下是打码后的日志："
+              sed -E 's/token=[a-zA-Z0-9_\-]+/token=***/g' dsh-web.log | tail -n 20
+              exit 1
+            fi
+          done
+
+      - name: Backup DSH data to private repository
+        if: always()
+        run: |
+          if [ -d ~/.dsh ]; then
+            mkdir -p ./private-data/dsh-data
+            rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
+            cd private-data
+            git config user.name "DSH Agent"
+            git config user.email "dsh-agent@users.noreply.github.com"
+            git add ./dsh-data
+            git diff --staged --quiet || git commit -m "Backup from public runner $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+          fi
