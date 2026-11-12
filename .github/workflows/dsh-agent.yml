@@ -36,15 +36,30 @@ jobs:
           curl -sL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
 
-      - name: Restore DSH data from private repository
+      # ================= 核心修改：恢复工作区与配置 =================
+      - name: Restore DSH data and workspaces
         run: |
+          # 1. 恢复 ~/.dsh 配置
           if [ -d "./private-data/dsh-data" ]; then
             mkdir -p ~/.dsh
             rsync -a --delete ./private-data/dsh-data/ ~/.dsh/
-            echo "DSH data restored."
-          else
-            echo "No previous DSH data found. Starting fresh."
+            echo "✅ DSH data restored."
           fi
+          
+          # 2. 恢复工作区目录 (例如 /home/runner/test)
+          if [ -d "./private-data/workspaces" ]; then
+            # 遍历备份的工作区，恢复到 /home/runner/ 下
+            for dir in ./private-data/workspaces/*; do
+              if [ -d "$dir" ]; then
+                dirname=$(basename "$dir")
+                echo "Restoring workspace: /home/runner/$dirname"
+                mkdir -p "/home/runner/$dirname"
+                rsync -a --delete "$dir/" "/home/runner/$dirname/"
+              fi
+            done
+            echo "✅ Workspaces restored."
+          fi
+      # ==============================================================
 
       - name: Fix DSH data permissions
         run: |
@@ -68,9 +83,7 @@ jobs:
 
       - name: Start DSH Web
         run: |
-          # 提前将域名加入脱敏列表
           echo "::add-mask::$CUSTOM_DOMAIN"
-          
           PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
           setsid dsh web --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
           echo "Waiting for DSH Web on port 3080..."
@@ -82,20 +95,13 @@ jobs:
             echo "⚠️ DSH Web may not be ready."
           fi
 
-          # 提取 Token URL
           RAW_TOKEN_URL=$(grep -oE 'https?://[^ ]+token=[a-zA-Z0-9_\-]+' dsh-web.log | head -1)
-          
           if [ -n "$RAW_TOKEN_URL" ]; then
             TOKEN_STR=$(echo "$RAW_TOKEN_URL" | sed -E 's/.*token=([a-zA-Z0-9_\-]+).*/\1/')
             TOKEN_URL="https://${PUBLIC_HOST}/?token=${TOKEN_STR}"
-            
             echo "::add-mask::$TOKEN_STR"
             echo "::add-mask::$TOKEN_URL"
-            
             echo "TOKEN_URL=$TOKEN_URL" >> $GITHUB_ENV
-            echo "✅ 成功提取访问地址，并已开启自动掩码保护。"
-          else
-            echo "⚠️ 未在日志中直接找到带 token 的 URL。"
           fi
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
@@ -105,23 +111,13 @@ jobs:
         continue-on-error: true 
         run: |
           echo "正在推送到微信接口..."
-          
           TOKEN="${{ secrets.WX_TOKEN }}"
           TS=$(date +%s)
           NONCE=$RANDOM
           
-          echo "--- 签名参数核对 ---"
-          echo "Timestamp: $TS"
-          echo "Nonce: $NONCE"
-          
-          # 强制使用 ASCII 字典序排序
           SORT_STR=$(printf "%s\n%s\n%s" "$TOKEN" "$TS" "$NONCE" | LC_ALL=C sort | tr -d "\n")
-          echo "待计算 SHA1 的拼接字符串: $SORT_STR"
-          
           SIG=$(echo -n "$SORT_STR" | sha1sum | awk '{print $1}')
-          echo "生成签名: $SIG"
-          echo "--------------------"
-
+          
           XML_DATA="<xml>
             <ToUserName><![CDATA[gh_test]]></ToUserName>
             <FromUserName><![CDATA[oUPTI2yAIBpKK_YkxHttqSc7TYiw]]></FromUserName>
@@ -130,51 +126,55 @@ jobs:
             <Content><![CDATA[202 ${{ env.TOKEN_URL }}]]></Content>
           </xml>"
           
-          echo "=== 开始发送请求 ==="
           REQ_URL="${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE"
-          echo "原始请求 URL: $REQ_URL"
           
-          # 移除伪造的浏览器 UA，使用标准 curl 请求，避免触发浏览器完整性检查
           HTTP_STATUS=$(curl -L --post301 --post302 -s -w "%{http_code}" -o response.txt -X POST \
             "$REQ_URL" \
             -H 'Content-Type: text/xml' \
             --data-binary "$XML_DATA")
             
           echo "最终 HTTP 状态码: $HTTP_STATUS"
-          echo "======== 响应内容 ========"
           cat response.txt
-          echo -e "\n=========================="
-          
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-            echo "✅ 微信推送成功"
-          else
-            echo "⚠️ 微信推送失败"
-          fi
 
       - name: Keep alive
         run: |
           echo "DSH Web 正在运行。"
-          echo "✅ 访问链接及 Token 已尝试推送至微信，请在微信中查收（为保护隐私，日志中不予显示）。"
-          
           while true; do 
             sleep 30
             if ! pgrep -f "dsh web" > /dev/null; then
-              echo "❌ DSH Web 进程已退出！以下是打码后的日志："
-              sed -E 's/token=[a-zA-Z0-9_\-]+/token=***/g' dsh-web.log | tail -n 20
+              echo "❌ DSH Web 进程已退出！"
               exit 1
             fi
           done
 
-      - name: Backup DSH data to private repository
+      # ================= 核心修改：备份工作区与配置 =================
+      - name: Backup DSH data and workspaces
         if: always()
         run: |
+          # 1. 备份 DSH 配置
           if [ -d ~/.dsh ]; then
             mkdir -p ./private-data/dsh-data
             rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
-            cd private-data
-            git config user.name "DSH Agent"
-            git config user.email "dsh-agent@users.noreply.github.com"
-            git add ./dsh-data
-            git diff --staged --quiet || git commit -m "Backup from public runner $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
+            echo "✅ DSH data backed up."
           fi
+
+          # 2. 备份工作区目录
+          mkdir -p ./private-data/workspaces
+          # 遍历 /home/runner 下的普通文件夹（排除隐藏的系统文件夹）
+          for dir in /home/runner/*; do
+            if [ -d "$dir" ] && [[ ! $(basename "$dir") == .* ]]; then
+              dirname=$(basename "$dir")
+              echo "Backing up workspace: $dirname"
+              mkdir -p "./private-data/workspaces/$dirname"
+              rsync -a --delete "$dir/" "./private-data/workspaces/$dirname/"
+            fi
+          done
+          
+          # 3. 推送到私有仓库
+          cd private-data
+          git config user.name "DSH Agent"
+          git config user.email "dsh-agent@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "Backup data and workspaces $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push
+      # ==============================================================
