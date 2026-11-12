@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  CUSTOM_DOMAIN: "https://dsh.gyegt614.top"
+  CUSTOM_DOMAIN: "https://dsh.gyegt614.top" # 你的固定域名
 
 jobs:
   run-dsh-web:
@@ -42,6 +42,8 @@ jobs:
             mkdir -p ~/.dsh
             rsync -a --delete ./private-data/dsh-data/ ~/.dsh/
             echo "DSH data restored."
+          else
+            echo "No previous DSH data found. Starting fresh."
           fi
 
       - name: Fix DSH data permissions
@@ -49,15 +51,21 @@ jobs:
           chmod 700 ~/.dsh
           if [ -f ~/.dsh/.credentials.yaml ]; then
             chmod 600 ~/.dsh/.credentials.yaml
+            echo "✅ ~/.dsh/.credentials.yaml permission set to 600."
           fi
 
       - name: Start Cloudflare Named Tunnel
         run: |
           nohup ./cloudflared tunnel --no-autoupdate run --token ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
+          echo "Waiting for Named Tunnel to connect..."
           for i in $(seq 1 30); do
-            if grep -q "Registered tunnel connection" tunnel.log; then break; fi
+            if grep -q "Registered tunnel connection" tunnel.log; then
+              echo "✅ Named Tunnel connected."
+              break
+            fi
             sleep 1
           done
+          tail -n 10 tunnel.log
 
       - name: Start DSH Web
         run: |
@@ -66,30 +74,41 @@ jobs:
           
           PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
           setsid dsh web --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
+          echo "Waiting for DSH Web on port 3080..."
           sleep 15
           
           if curl -s http://127.0.0.1:3080 > /dev/null; then
             echo "✅ DSH Web is ready."
           else
-            echo "⚠️ DSH Web may not be ready. Showing sanitized log:"
-            # 打印日志前，强制把 token=xxxx 替换为 token=***
-            sed -E 's/token=[a-zA-Z0-9]+/token=***/g' dsh-web.log | tail -n 20
+            echo "⚠️ DSH Web may not be ready."
           fi
 
-          # 提取 Token URL
-          RAW_TOKEN_URL=$(grep -oE 'http://[0-9a-zA-Z\.]+:3080/\?token=[a-zA-Z0-9]+' dsh-web.log | head -1)
+          # 使用更宽泛的正则，兼容 localhost、0.0.0.0 以及带有 - 和 _ 的 token
+          echo "正在尝试提取 Token..."
+          RAW_TOKEN_URL=$(grep -oE 'https?://[^ ]+token=[a-zA-Z0-9_\-]+' dsh-web.log | head -1)
+          
           if [ -n "$RAW_TOKEN_URL" ]; then
-            TOKEN_URL=$(echo "$RAW_TOKEN_URL" | sed "s|http://127.0.0.1:3080|https://${PUBLIC_HOST}|g")
+            # 提取纯净的 token 字符串
+            TOKEN_STR=$(echo "$RAW_TOKEN_URL" | sed -E 's/.*token=([a-zA-Z0-9_\-]+).*/\1/')
             
-            # 【关键】将完整的 URL 加入 GitHub 的脱敏列表
+            # 统一拼接为你的公网域名
+            TOKEN_URL="https://${PUBLIC_HOST}/?token=${TOKEN_STR}"
+            
+            # 【关键】将完整 URL 和 Token 加入 GitHub 脱敏列表
+            echo "::add-mask::$TOKEN_STR"
             echo "::add-mask::$TOKEN_URL"
             
             echo "TOKEN_URL=$TOKEN_URL" >> $GITHUB_ENV
             echo "✅ 成功提取访问地址，并已开启自动掩码保护。"
           else
-            echo "⚠️ 未在日志中直接找到带 token 的 URL。"
+            echo "⚠️ 未在日志中直接找到带 token 的 URL。下面是脱敏后的日志供排查："
+            # 将打印出来的日志里的 token 强制打码
+            sed -E 's/token=[a-zA-Z0-9_\-]+/token=***/g' dsh-web.log | head -n 50
           fi
+        env:
+          DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
 
+      # 推送到微信接口
       - name: Push URL to WX API
         if: env.TOKEN_URL != ''
         continue-on-error: true 
@@ -99,11 +118,12 @@ jobs:
           TOKEN="${{ secrets.WX_TOKEN }}"
           TS=$(date +%s)
           NONCE=$RANDOM
-          SIG=$(printf '%s\n' "$TOKEN" "$TS" "$NONCE" | sort | tr -d '\n' | sha1sum | cut -d' ' -f1)
           
-          # 签名也加入脱敏
+          # 按照微信官方规则计算签名 (字典序排序 -> 拼接 -> SHA1)
+          SIG=$(printf '%s\n' "$TOKEN" "$TS" "$NONCE" | sort | tr -d '\n' | sha1sum | cut -d' ' -f1)
           echo "::add-mask::$SIG"
 
+          # 构造 XML 报文（将环境变量 TOKEN_URL 填入 Content）
           XML_DATA="<xml>
             <ToUserName><![CDATA[gh_test]]></ToUserName>
             <FromUserName><![CDATA[oUPTI2yAIBpKK_YkxHttqSc7TYiw]]></FromUserName>
@@ -112,6 +132,7 @@ jobs:
             <Content><![CDATA[202 ${{ env.TOKEN_URL }}]]></Content>
           </xml>"
           
+          # 发送 POST 请求（注意 URL 中的变量替换）
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             "${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE" \
             -H 'Content-Type: text/xml' \
@@ -126,12 +147,13 @@ jobs:
       - name: Keep alive
         run: |
           echo "DSH Web 正在运行。"
-          echo "✅ 访问链接及 Token 已推送至微信，请在手机微信中查收（为保护隐私，日志中不予显示）。"
-          while true; do
+          echo "✅ 访问链接及 Token 已尝试推送至微信，请在微信中查收（为保护隐私，日志中不予显示）。"
+          
+          while true; do 
             sleep 30
             if ! pgrep -f "dsh web" > /dev/null; then
               echo "❌ DSH Web 进程已退出！以下是打码后的日志："
-              sed -E 's/token=[a-zA-Z0-9]+/token=***/g' dsh-web.log | tail -n 20
+              sed -E 's/token=[a-zA-Z0-9_\-]+/token=***/g' dsh-web.log | tail -n 20
               exit 1
             fi
           done
@@ -146,6 +168,6 @@ jobs:
             git config user.name "DSH Agent"
             git config user.email "dsh-agent@users.noreply.github.com"
             git add ./dsh-data
-            git diff --staged --quiet || git commit -m "Backup $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git diff --staged --quiet || git commit -m "Backup from public runner $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
           fi
