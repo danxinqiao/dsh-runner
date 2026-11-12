@@ -1,4 +1,3 @@
-
 name: DSH Web with Named Tunnel (Token Mode)
 
 on:
@@ -55,7 +54,9 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "24"
-          cache: "pnpm"
+          # 本项目不使用 pnpm 管理依赖，也没有 pnpm-lock.yaml。
+          # 显式禁用 package-manager-cache，避免 setup-node 报错。
+          package-manager-cache: false
 
       # --------------------------------------------------
       # 5. Install DSH
