@@ -134,11 +134,10 @@ jobs:
           REQ_URL="${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE"
           echo "原始请求 URL: $REQ_URL"
           
-          # 加入 -L 跟随重定向，--post301 --post302 确保重定向后依然使用 POST 方法
+          # 移除伪造的浏览器 UA，使用标准 curl 请求，避免触发浏览器完整性检查
           HTTP_STATUS=$(curl -L --post301 --post302 -s -w "%{http_code}" -o response.txt -X POST \
             "$REQ_URL" \
             -H 'Content-Type: text/xml' \
-            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)' \
             --data-binary "$XML_DATA")
             
           echo "最终 HTTP 状态码: $HTTP_STATUS"
