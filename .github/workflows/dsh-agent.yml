@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  CUSTOM_DOMAIN: "https://dsh.gyegt614.top" # 你的固定域名
+  CUSTOM_DOMAIN: "https://dsh.gyegt614.top"
 
 jobs:
   run-dsh-web:
@@ -36,18 +36,12 @@ jobs:
           curl -sL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
 
-      # 保留密码保护插件
-      - name: Install DSH web auth plugin
-        run: dsh plugin --profile web add -w @fonlan/dsh-web-auth
-
       - name: Restore DSH data from private repository
         run: |
           if [ -d "./private-data/dsh-data" ]; then
             mkdir -p ~/.dsh
             rsync -a --delete ./private-data/dsh-data/ ~/.dsh/
             echo "DSH data restored."
-          else
-            echo "No previous DSH data found. Starting fresh."
           fi
 
       - name: Fix DSH data permissions
@@ -55,73 +49,90 @@ jobs:
           chmod 700 ~/.dsh
           if [ -f ~/.dsh/.credentials.yaml ]; then
             chmod 600 ~/.dsh/.credentials.yaml
-            echo "✅ ~/.dsh/.credentials.yaml permission set to 600."
           fi
 
       - name: Start Cloudflare Named Tunnel
         run: |
           nohup ./cloudflared tunnel --no-autoupdate run --token ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
-          echo "Waiting for Named Tunnel to connect..."
           for i in $(seq 1 30); do
-            if grep -q "Registered tunnel connection" tunnel.log; then
-              echo "✅ Named Tunnel connected."
-              break
-            fi
+            if grep -q "Registered tunnel connection" tunnel.log; then break; fi
             sleep 1
           done
-          tail -n 20 tunnel.log
 
       - name: Start DSH Web
         run: |
+          # 提前将域名加入脱敏列表
+          echo "::add-mask::$CUSTOM_DOMAIN"
+          
           PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
           setsid dsh web --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
-          echo "Waiting for DSH Web on port 3080..."
           sleep 15
           
           if curl -s http://127.0.0.1:3080 > /dev/null; then
             echo "✅ DSH Web is ready."
           else
-            echo "⚠️ DSH Web may not be ready. Showing log:"
-            cat dsh-web.log
+            echo "⚠️ DSH Web may not be ready. Showing sanitized log:"
+            # 打印日志前，强制把 token=xxxx 替换为 token=***
+            sed -E 's/token=[a-zA-Z0-9]+/token=***/g' dsh-web.log | tail -n 20
           fi
 
-          # 【核心修改】从日志中提取包含 token 的本地 URL，并替换为公网域名
-          echo "正在提取登录 Token..."
-          # 匹配类似于 http://127.0.0.1:3080/?token=xxxx 的字符串
+          # 提取 Token URL
           RAW_TOKEN_URL=$(grep -oE 'http://[0-9a-zA-Z\.]+:3080/\?token=[a-zA-Z0-9]+' dsh-web.log | head -1)
-          
           if [ -n "$RAW_TOKEN_URL" ]; then
-            # 将本地地址替换为你的公网域名
             TOKEN_URL=$(echo "$RAW_TOKEN_URL" | sed "s|http://127.0.0.1:3080|https://${PUBLIC_HOST}|g")
-            echo "✅ 找到带 Token 的访问链接: $TOKEN_URL"
+            
+            # 【关键】将完整的 URL 加入 GitHub 的脱敏列表
+            echo "::add-mask::$TOKEN_URL"
+            
             echo "TOKEN_URL=$TOKEN_URL" >> $GITHUB_ENV
+            echo "✅ 成功提取访问地址，并已开启自动掩码保护。"
           else
-            echo "⚠️ 未在日志中直接找到带 token 的 URL，以下为 DSH 启动日志："
-            cat dsh-web.log
+            echo "⚠️ 未在日志中直接找到带 token 的 URL。"
           fi
-        env:
-          DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
+
+      - name: Push URL to WX API
+        if: env.TOKEN_URL != ''
+        continue-on-error: true 
+        run: |
+          echo "正在推送到微信接口..."
+          
+          TOKEN="${{ secrets.WX_TOKEN }}"
+          TS=$(date +%s)
+          NONCE=$RANDOM
+          SIG=$(printf '%s\n' "$TOKEN" "$TS" "$NONCE" | sort | tr -d '\n' | sha1sum | cut -d' ' -f1)
+          
+          # 签名也加入脱敏
+          echo "::add-mask::$SIG"
+
+          XML_DATA="<xml>
+            <ToUserName><![CDATA[gh_test]]></ToUserName>
+            <FromUserName><![CDATA[oUPTI2yAIBpKK_YkxHttqSc7TYiw]]></FromUserName>
+            <CreateTime>$(date +%s)</CreateTime>
+            <MsgType><![CDATA[text]]></MsgType>
+            <Content><![CDATA[202 ${{ env.TOKEN_URL }}]]></Content>
+          </xml>"
+          
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            "${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE" \
+            -H 'Content-Type: text/xml' \
+            --data-binary "$XML_DATA")
+            
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ 微信推送成功 (HTTP $HTTP_STATUS)"
+          else
+            echo "⚠️ 微信推送失败 (HTTP $HTTP_STATUS)"
+          fi
 
       - name: Keep alive
         run: |
-          echo "DSH Web 和隧道正在运行。要停止，请手动点击 'Cancel workflow'。"
-          echo "=================================================="
-          if [ -n "$TOKEN_URL" ]; then
-            echo "👉 请复制以下完整链接在浏览器中打开："
-            echo "$TOKEN_URL"
-          else
-            echo "❌ 未能自动提取 Token URL，请查看上方 'Start DSH Web' 日志。"
-          fi
-          echo "=================================================="
-          echo "（提示：通过带 token 的链接访问一次后，浏览器会记住 Cookie。之后直接访问 $CUSTOM_DOMAIN 即可，直到下次重启工作流）"
-          
+          echo "DSH Web 正在运行。"
+          echo "✅ 访问链接及 Token 已推送至微信，请在手机微信中查收（为保护隐私，日志中不予显示）。"
           while true; do
             sleep 30
-            if pgrep -f "dsh web" > /dev/null; then
-              echo "✅ DSH Web 进程正在运行。"
-            else
-              echo "❌ DSH Web 进程已退出！"
-              tail -n 20 dsh-web.log
+            if ! pgrep -f "dsh web" > /dev/null; then
+              echo "❌ DSH Web 进程已退出！以下是打码后的日志："
+              sed -E 's/token=[a-zA-Z0-9]+/token=***/g' dsh-web.log | tail -n 20
+              exit 1
             fi
           done
 
@@ -132,9 +143,9 @@ jobs:
             mkdir -p ./private-data/dsh-data
             rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
             cd private-data
-            git config user.name "DSH Agent (Public Runner)"
+            git config user.name "DSH Agent"
             git config user.email "dsh-agent@users.noreply.github.com"
             git add ./dsh-data
-            git diff --staged --quiet || git commit -m "Backup from public runner $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git diff --staged --quiet || git commit -m "Backup $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
           fi
