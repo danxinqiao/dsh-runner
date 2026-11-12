@@ -1,10 +1,22 @@
-name: DSH Web with Named Tunnel (Token Mode)
+
+name: DSH Web with Persistent Agent Memory
 
 on:
   workflow_dispatch:
 
+# 防止多个 Runner 同时修改持久化仓库
+concurrency:
+  group: dsh-web-persistent-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 env:
-  CUSTOM_DOMAIN: "https://dsh.gyegt614.top" # 你的固定域名
+  CUSTOM_DOMAIN: "https://dsh.gyegt614.top"
+  BACKUP_INTERVAL: "600"
+  PRIVATE_DATA_DIR: "private-data"
+  ALLOW_EMPTY_BOOTSTRAP: "false"
 
 jobs:
   run-dsh-web:
@@ -12,16 +24,26 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      # ==========================================
+      # 1. Checkout 公共 Runner 仓库
+      # ==========================================
       - name: Checkout public runner repo
         uses: actions/checkout@v5
 
+      # ==========================================
+      # 2. Checkout 私有数据仓库
+      # ==========================================
       - name: Checkout private data repository
         uses: actions/checkout@v5
         with:
           repository: ${{ secrets.PRIVATE_DATA_REPO }}
           token: ${{ secrets.PRIVATE_DATA_REPO_PAT }}
-          path: 'private-data'
+          path: private-data
+          fetch-depth: 0
 
+      # ==========================================
+      # 3. 安装运行环境
+      # ==========================================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -33,147 +55,470 @@ jobs:
       - name: Install DSH and cloudflared
         run: |
           npm install -g @deepseek-ai/dsh@alpha
-          curl -sL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+
+          curl -fsSL -o cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+
           chmod +x cloudflared
 
-      # ================= 恢复工作区与配置 =================
+      # ==========================================
+      # 4. 恢复 DSH 数据与工作区
+      # ==========================================
       - name: Restore DSH data and workspaces
+        id: restore
+        shell: bash
         run: |
-          # 1. 恢复 ~/.dsh 配置
-          if [ -d "./private-data/dsh-data" ]; then
-            mkdir -p ~/.dsh
-            rsync -a --delete ./private-data/dsh-data/ ~/.dsh/
-            echo "✅ DSH data restored."
-          fi
-          
-          # 2. 恢复工作区目录 (例如 /home/runner/test_1)
-          if [ -d "./private-data/workspaces" ]; then
-            for dir in ./private-data/workspaces/*; do
-              if [ -d "$dir" ]; then
-                dirname=$(basename "$dir")
-                echo "Restoring workspace: /home/runner/$dirname"
-                mkdir -p "/home/runner/$dirname"
-                rsync -a --delete "$dir/" "/home/runner/$dirname/"
-              fi
-            done
-            echo "✅ Workspaces restored."
+          set -Eeuo pipefail
+
+          PRIVATE_DATA="./private-data"
+
+          echo "Checking persistent data repository..."
+
+          if [ ! -d "$PRIVATE_DATA/.git" ]; then
+            echo "ERROR: Private data repository is unavailable."
+            exit 1
           fi
 
-      - name: Fix DSH data permissions
-        run: |
-          chmod 700 ~/.dsh
-          if [ -f ~/.dsh/.credentials.yaml ]; then
-            chmod 600 ~/.dsh/.credentials.yaml
-            echo "✅ ~/.dsh/.credentials.yaml permission set to 600."
-          fi
+          # 检查 DSH 数据是否存在
+          if [ ! -d "$PRIVATE_DATA/dsh-data" ]; then
 
-      - name: Start Cloudflare Named Tunnel
-        run: |
-          nohup ./cloudflared tunnel --no-autoupdate run --token ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
-          echo "Waiting for Named Tunnel to connect..."
-          for i in $(seq 1 30); do
-            if grep -q "Registered tunnel connection" tunnel.log; then
-              echo "✅ Named Tunnel connected."
-              break
+            if [ "$ALLOW_EMPTY_BOOTSTRAP" = "true" ]; then
+              echo "No previous DSH data. Initializing empty storage."
+              mkdir -p "$PRIVATE_DATA/dsh-data"
+            else
+              echo "ERROR: dsh-data does not exist."
+              echo "Refusing to start with an empty DSH environment."
+              exit 1
             fi
-            sleep 1
+
+          fi
+
+          # 恢复 DSH 配置、会话和历史数据
+          mkdir -p "$HOME/.dsh"
+
+          rsync -a --delete \
+            "$PRIVATE_DATA/dsh-data/" \
+            "$HOME/.dsh/"
+
+          echo "DSH data restored."
+
+          # 恢复所有工作区
+          if [ -d "$PRIVATE_DATA/workspaces" ]; then
+
+            for dir in "$PRIVATE_DATA"/workspaces/*; do
+
+              [ -d "$dir" ] || continue
+
+              dirname=$(basename "$dir")
+
+              echo "Restoring workspace: $dirname"
+
+              mkdir -p "/home/runner/$dirname"
+
+              rsync -a --delete \
+                "$dir/" \
+                "/home/runner/$dirname/"
+
+            done
+
+          fi
+
+          echo "Workspaces restored."
+
+          # 修复权限
+          chmod 700 "$HOME/.dsh"
+
+          if [ -f "$HOME/.dsh/.credentials.yaml" ]; then
+            chmod 600 "$HOME/.dsh/.credentials.yaml"
+          fi
+
+          # 检查恢复结果
+          test -d "$HOME/.dsh"
+
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+
+          echo "Persistent data restoration completed."
+
+      # ==========================================
+      # 5. 创建统一备份脚本
+      # ==========================================
+      - name: Prepare persistent backup script
+        run: |
+          cat > "$RUNNER_TEMP/dsh-backup.sh" <<'BACKUP_SCRIPT'
+          #!/usr/bin/env bash
+
+          set -Eeuo pipefail
+
+          PRIVATE_DATA="$GITHUB_WORKSPACE/$PRIVATE_DATA_DIR"
+
+          # 防止同一 Runner 内重复执行备份
+          exec 9>"$RUNNER_TEMP/dsh-backup.lock"
+
+          if ! flock -n 9; then
+            echo "Another backup is running. Skipping."
+            exit 0
+          fi
+
+          if [ ! -d "$PRIVATE_DATA/.git" ]; then
+            echo "ERROR: Private repository is unavailable."
+            exit 1
+          fi
+
+          if [ ! -d "$HOME/.dsh" ]; then
+            echo "ERROR: DSH data directory is missing."
+            exit 1
+          fi
+
+          echo "Starting DSH backup..."
+
+          mkdir -p "$PRIVATE_DATA/dsh-data"
+          mkdir -p "$PRIVATE_DATA/workspaces"
+
+          # 1. 备份完整 DSH 数据
+          rsync -a --delete \
+            "$HOME/.dsh/" \
+            "$PRIVATE_DATA/dsh-data/"
+
+          # 2. 备份工作区
+          for dir in /home/runner/*; do
+
+            [ -d "$dir" ] || continue
+
+            dirname=$(basename "$dir")
+
+            case "$dirname" in
+              actions-runner|work|_work|hostedtoolcache|toolcache)
+                continue
+                ;;
+            esac
+
+            echo "Backing up workspace: $dirname"
+
+            mkdir -p "$PRIVATE_DATA/workspaces/$dirname"
+
+            rsync -a --delete \
+              "$dir/" \
+              "$PRIVATE_DATA/workspaces/$dirname/"
+
           done
 
-      - name: Start DSH Web
-        run: |
-          echo "::add-mask::$CUSTOM_DOMAIN"
-          PUBLIC_HOST=$(echo "$CUSTOM_DOMAIN" | sed -e 's|https\?://||')
-          setsid dsh web --public-url "$CUSTOM_DOMAIN" --trusted-host "$PUBLIC_HOST" > dsh-web.log 2>&1 < /dev/null &
-          echo "Waiting for DSH Web on port 3080..."
-          sleep 15
-          
-          if curl -s http://127.0.0.1:3080 > /dev/null; then
-            echo "✅ DSH Web is ready."
-          else
-            echo "⚠️ DSH Web may not be ready."
+          # 3. Git 增量提交
+          git -C "$PRIVATE_DATA" config user.name "DSH Agent"
+          git -C "$PRIVATE_DATA" config user.email \
+            "dsh-agent@users.noreply.github.com"
+
+          git -C "$PRIVATE_DATA" add -A -- dsh-data workspaces
+
+          if git -C "$PRIVATE_DATA" diff --cached --quiet; then
+            echo "No data changes. Backup skipped."
+            exit 0
           fi
 
-          RAW_TOKEN_URL=$(grep -oE 'https?://[^ ]+token=[a-zA-Z0-9_\-]+' dsh-web.log | head -1)
-          if [ -n "$RAW_TOKEN_URL" ]; then
-            TOKEN_STR=$(echo "$RAW_TOKEN_URL" | sed -E 's/.*token=([a-zA-Z0-9_\-]+).*/\1/')
-            TOKEN_URL="https://${PUBLIC_HOST}/?token=${TOKEN_STR}"
-            echo "::add-mask::$TOKEN_STR"
-            echo "::add-mask::$TOKEN_URL"
-            echo "TOKEN_URL=$TOKEN_URL" >> $GITHUB_ENV
+          git -C "$PRIVATE_DATA" commit \
+            -m "DSH automatic backup $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          # 4. 推送并处理远程更新
+          BRANCH=$(git -C "$PRIVATE_DATA" branch --show-current)
+
+          if [ -z "$BRANCH" ]; then
+            echo "ERROR: Cannot determine backup branch."
+            exit 1
           fi
+
+          for attempt in 1 2 3; do
+
+            if git -C "$PRIVATE_DATA" push origin "$BRANCH"; then
+              echo "Backup pushed successfully."
+              exit 0
+            fi
+
+            echo "Push failed. Attempt: $attempt"
+
+            if [ "$attempt" -lt 3 ]; then
+
+              git -C "$PRIVATE_DATA" fetch origin "$BRANCH"
+
+              if ! git -C "$PRIVATE_DATA" rebase "origin/$BRANCH"; then
+                git -C "$PRIVATE_DATA" rebase --abort || true
+
+                echo "ERROR: Git rebase conflict."
+                exit 1
+              fi
+
+            fi
+
+          done
+
+          echo "ERROR: Backup push failed after 3 attempts."
+          exit 1
+
+          BACKUP_SCRIPT
+
+          chmod +x "$RUNNER_TEMP/dsh-backup.sh"
+
+      # ==========================================
+      # 6. 启动 Cloudflare Named Tunnel
+      # ==========================================
+      - name: Start Cloudflare Named Tunnel
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "ERROR: Cloudflare tunnel token is missing."
+            exit 1
+          fi
+
+          nohup ./cloudflared tunnel \
+            --no-autoupdate run \
+            --token "$CLOUDFLARE_TUNNEL_TOKEN" \
+            > tunnel.log 2>&1 < /dev/null &
+
+          echo $! > cloudflared.pid
+
+          echo "Waiting for Cloudflare Tunnel..."
+
+          CONNECTED=false
+
+          for i in $(seq 1 60); do
+
+            if grep -q "Registered tunnel connection" tunnel.log; then
+              CONNECTED=true
+              break
+            fi
+
+            if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
+              echo "ERROR: cloudflared exited."
+              break
+            fi
+
+            sleep 1
+
+          done
+
+          if [ "$CONNECTED" != "true" ]; then
+            echo "ERROR: Tunnel connection failed."
+            tail -50 tunnel.log
+            exit 1
+          fi
+
+          echo "Cloudflare Tunnel connected."
+
+      # ==========================================
+      # 7. 启动 DSH Web
+      # ==========================================
+      - name: Start DSH Web
+        id: dsh
         env:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
-
-      - name: Push URL to WX API
-        if: env.TOKEN_URL != ''
-        continue-on-error: true 
         run: |
-          echo "正在推送到微信接口..."
-          TOKEN="${{ secrets.WX_TOKEN }}"
+          set -Eeuo pipefail
+
+          PUBLIC_HOST="${CUSTOM_DOMAIN#https://}"
+          PUBLIC_HOST="${PUBLIC_HOST#http://}"
+          PUBLIC_HOST="${PUBLIC_HOST%/}"
+
+          echo "Starting DSH Web..."
+
+          setsid dsh web \
+            --public-url "$CUSTOM_DOMAIN" \
+            --trusted-host "$PUBLIC_HOST" \
+            > dsh-web.log 2>&1 < /dev/null &
+
+          echo $! > dsh-web.pid
+
+          echo "Waiting for DSH Web..."
+
+          READY=false
+
+          for i in $(seq 1 60); do
+
+            if curl -fsS http://127.0.0.1:3080 >/dev/null; then
+              READY=true
+              break
+            fi
+
+            sleep 1
+
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "ERROR: DSH Web failed to start."
+            tail -50 dsh-web.log
+            exit 1
+          fi
+
+          echo "DSH Web is ready."
+
+          # 提取访问 Token
+          RAW_TOKEN_URL=$(
+            grep -oE 'https?://[^[:space:]]*token=[a-zA-Z0-9_-]+' \
+              dsh-web.log | head -1 || true
+          )
+
+          if [ -n "$RAW_TOKEN_URL" ]; then
+
+            TOKEN_STR=$(
+              echo "$RAW_TOKEN_URL" |
+              sed -E 's/.*token=([a-zA-Z0-9_-]+).*/\1/'
+            )
+
+            TOKEN_URL="https://${PUBLIC_HOST}/?token=${TOKEN_STR}"
+
+            echo "::add-mask::$TOKEN_STR"
+            echo "::add-mask::$TOKEN_URL"
+
+            echo "TOKEN_URL=$TOKEN_URL" >> "$GITHUB_ENV"
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+
+            echo "DSH access token extracted."
+
+          else
+
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: No access token found in DSH log."
+
+          fi
+
+      # ==========================================
+      # 8. 推送 URL 到微信接口
+      # ==========================================
+      - name: Push URL to WX API
+        if: steps.dsh.outputs.has_token == 'true'
+        continue-on-error: true
+        env:
+          WX_TOKEN: ${{ secrets.WX_TOKEN }}
+          PUSH_API_URL: ${{ secrets.PUSH_API_URL }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "Pushing DSH URL to WX API..."
+
           TS=$(date +%s)
           NONCE=$RANDOM
-          
-          SORT_STR=$(printf "%s\n%s\n%s" "$TOKEN" "$TS" "$NONCE" | LC_ALL=C sort | tr -d "\n")
-          SIG=$(echo -n "$SORT_STR" | sha1sum | awk '{print $1}')
-          
-          XML_DATA="<xml>
+
+          SORT_STR=$(
+            printf "%s\n%s\n%s" "$WX_TOKEN" "$TS" "$NONCE" |
+            LC_ALL=C sort |
+            tr -d "\n"
+          )
+
+          SIG=$(printf "%s" "$SORT_STR" | sha1sum | awk '{print $1}')
+
+          XML_DATA=$(cat <<EOF
+          <xml>
             <ToUserName><![CDATA[gh_test]]></ToUserName>
             <FromUserName><![CDATA[oUPTI2yAIBpKK_YkxHttqSc7TYiw]]></FromUserName>
             <CreateTime>$(date +%s)</CreateTime>
             <MsgType><![CDATA[text]]></MsgType>
-            <Content><![CDATA[202 ${{ env.TOKEN_URL }}]]></Content>
-          </xml>"
-          
-          REQ_URL="${{ secrets.PUSH_API_URL }}?signature=$SIG&timestamp=$TS&nonce=$NONCE"
-          
-          HTTP_STATUS=$(curl -L --post301 --post302 -s -w "%{http_code}" -o response.txt -X POST \
+            <Content><![CDATA[202 ${TOKEN_URL}]]></Content>
+          </xml>
+          EOF
+          )
+
+          REQ_URL="${PUSH_API_URL}?signature=${SIG}&timestamp=${TS}&nonce=${NONCE}"
+
+          HTTP_STATUS=$(curl -L --post301 --post302 -sS \
+            -w "%{http_code}" \
+            -o response.txt \
+            -X POST \
             "$REQ_URL" \
             -H 'Content-Type: text/xml' \
             --data-binary "$XML_DATA")
-            
-          echo "最终 HTTP 状态码: $HTTP_STATUS"
+
+          echo "HTTP Status: $HTTP_STATUS"
+
           cat response.txt
 
-      - name: Keep alive
+      # ==========================================
+      # 9. 运行期间自动备份
+      # ==========================================
+      - name: Keep alive and periodic backup
+        timeout-minutes: 335
         run: |
-          echo "DSH Web 正在运行。"
-          while true; do 
+          set -Eeuo pipefail
+
+          echo "DSH Web is running."
+
+          # 启动后立即执行一次备份
+          bash "$RUNNER_TEMP/dsh-backup.sh"
+
+          START_TIME=$(date +%s)
+          LAST_BACKUP=$START_TIME
+
+          # 最多运行 330 分钟，为最终备份留出时间
+          MAX_RUNTIME=$((330 * 60))
+
+          while true; do
+
             sleep 30
-            if ! pgrep -f "dsh web" > /dev/null; then
-              echo "❌ DSH Web 进程已退出！"
+
+            # 检查 DSH 进程
+            if ! pgrep -f '[d]sh web' > /dev/null; then
+              echo "ERROR: DSH Web process exited."
               exit 1
             fi
+
+            NOW=$(date +%s)
+
+            ELAPSED=$((NOW - START_TIME))
+
+            # 定时备份
+            if (( NOW - LAST_BACKUP >= BACKUP_INTERVAL )); then
+
+              echo "Periodic backup started."
+
+              bash "$RUNNER_TEMP/dsh-backup.sh"
+
+              LAST_BACKUP=$(date +%s)
+
+              echo "Periodic backup completed."
+
+            fi
+
+            # 到达运行时间后正常退出
+            if (( ELAPSED >= MAX_RUNTIME )); then
+
+              echo "Maximum runtime reached."
+              echo "Preparing final backup."
+
+              break
+
+            fi
+
           done
 
-      # ================= 核心修改：备份工作区与配置 =================
-      - name: Backup DSH data and workspaces
+      # ==========================================
+      # 10. 最终备份
+      # 只有成功恢复过数据才允许执行
+      # ==========================================
+      - name: Final backup DSH data and workspaces
+        if: always() && steps.restore.outputs.restored == 'true'
+        timeout-minutes: 15
+        run: |
+          set -Eeuo pipefail
+
+          echo "Starting final backup..."
+
+          bash "$RUNNER_TEMP/dsh-backup.sh"
+
+          echo "Final backup completed."
+
+      # ==========================================
+      # 11. 输出运行状态
+      # ==========================================
+      - name: Show DSH status
         if: always()
         run: |
-          # 1. 备份 DSH 配置
-          if [ -d ~/.dsh ]; then
-            mkdir -p ./private-data/dsh-data
-            rsync -a --delete ~/.dsh/ ./private-data/dsh-data/
-            echo "✅ DSH data backed up."
+          echo "=================================="
+          echo "DSH workflow finished."
+          echo "=================================="
+
+          if [ -f dsh-web.log ]; then
+            echo "DSH log file exists."
           fi
 
-          # 2. 备份工作区目录
-          mkdir -p ./private-data/workspaces
-          # 遍历 /home/runner 下的文件夹
-          for dir in /home/runner/*; do
-            dirname=$(basename "$dir")
-            # 【关键修复】排除隐藏目录、actions-runner 和 work
-            if [ -d "$dir" ] && [[ ! "$dirname" == .* ]] && [ "$dirname" != "actions-runner" ] && [ "$dirname" != "work" ]; then
-              echo "Backing up workspace: $dirname"
-              mkdir -p "./private-data/workspaces/$dirname"
-              rsync -a --delete "$dir/" "./private-data/workspaces/$dirname/"
-            fi
-          done
-          
-          # 3. 推送到私有仓库
-          cd private-data
-          git config user.name "DSH Agent"
-          git config user.email "dsh-agent@users.noreply.github.com"
-          git add .
-          git diff --staged --quiet || git commit -m "Backup data and workspaces $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          git push
-      # ==============================================================
+          if [ -f tunnel.log ]; then
+            echo "Tunnel log file exists."
+          fi
