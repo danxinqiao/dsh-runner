@@ -36,7 +36,7 @@ jobs:
           curl -sL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
 
-      # ================= 核心修改：恢复工作区与配置 =================
+      # ================= 恢复工作区与配置 =================
       - name: Restore DSH data and workspaces
         run: |
           # 1. 恢复 ~/.dsh 配置
@@ -46,9 +46,8 @@ jobs:
             echo "✅ DSH data restored."
           fi
           
-          # 2. 恢复工作区目录 (例如 /home/runner/test)
+          # 2. 恢复工作区目录 (例如 /home/runner/test_1)
           if [ -d "./private-data/workspaces" ]; then
-            # 遍历备份的工作区，恢复到 /home/runner/ 下
             for dir in ./private-data/workspaces/*; do
               if [ -d "$dir" ]; then
                 dirname=$(basename "$dir")
@@ -59,7 +58,6 @@ jobs:
             done
             echo "✅ Workspaces restored."
           fi
-      # ==============================================================
 
       - name: Fix DSH data permissions
         run: |
@@ -160,10 +158,11 @@ jobs:
 
           # 2. 备份工作区目录
           mkdir -p ./private-data/workspaces
-          # 遍历 /home/runner 下的普通文件夹（排除隐藏的系统文件夹）
+          # 遍历 /home/runner 下的文件夹
           for dir in /home/runner/*; do
-            if [ -d "$dir" ] && [[ ! $(basename "$dir") == .* ]]; then
-              dirname=$(basename "$dir")
+            dirname=$(basename "$dir")
+            # 【关键修复】排除隐藏目录、actions-runner 和 work
+            if [ -d "$dir" ] && [[ ! "$dirname" == .* ]] && [ "$dirname" != "actions-runner" ] && [ "$dirname" != "work" ]; then
               echo "Backing up workspace: $dirname"
               mkdir -p "./private-data/workspaces/$dirname"
               rsync -a --delete "$dir/" "./private-data/workspaces/$dirname/"
