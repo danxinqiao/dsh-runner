@@ -41,7 +41,15 @@ jobs:
           fetch-depth: 0
 
       # --------------------------------------------------
-      # 3. Setup Node.js and pnpm
+      # 3. Setup pnpm FIRST
+      # --------------------------------------------------
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      # --------------------------------------------------
+      # 4. Setup Node.js
       # --------------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -49,13 +57,8 @@ jobs:
           node-version: "24"
           cache: "pnpm"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: latest
-
       # --------------------------------------------------
-      # 4. Install DSH
+      # 5. Install DSH
       # --------------------------------------------------
       - name: Install DSH
         shell: bash
@@ -68,7 +71,7 @@ jobs:
           dsh --version
 
       # --------------------------------------------------
-      # 5. Install Cloudflare Tunnel
+      # 6. Install Cloudflare Tunnel
       # --------------------------------------------------
       - name: Install cloudflared
         shell: bash
@@ -86,7 +89,7 @@ jobs:
           cloudflared --version
 
       # --------------------------------------------------
-      # 6. Restore persistent DSH data and workspaces
+      # 7. Restore persistent DSH data and workspaces
       # --------------------------------------------------
       - name: Restore persistent data
         id: restore
@@ -142,8 +145,6 @@ jobs:
 
             echo "Restoring workspaces..."
 
-            mkdir -p "$PRIVATE_DIR/workspaces"
-
             find "$PRIVATE_DIR/workspaces" \
               -mindepth 1 \
               -maxdepth 1 \
@@ -179,7 +180,7 @@ jobs:
           echo "Persistent data restoration completed."
 
       # --------------------------------------------------
-      # 7. Configure Git for automatic backup
+      # 8. Configure Git for automatic backup
       # --------------------------------------------------
       - name: Configure backup Git
         shell: bash
@@ -193,7 +194,7 @@ jobs:
           echo "Private data repository configured."
 
       # --------------------------------------------------
-      # 8. Create backup script
+      # 9. Create backup script
       # --------------------------------------------------
       - name: Create backup script
         shell: bash
@@ -217,11 +218,9 @@ jobs:
 
           # Backup DSH data.
           if [ -d "$DSH_DIR" ]; then
-
             rsync -a --delete \
               "$DSH_DIR/" \
               "$PRIVATE_DIR/dsh-data/"
-
           fi
 
           # Backup workspaces.
@@ -298,7 +297,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/dsh-backup.sh"
 
       # --------------------------------------------------
-      # 9. Start Cloudflare Named Tunnel
+      # 10. Start Cloudflare Named Tunnel
       # --------------------------------------------------
       - name: Start Cloudflare Tunnel
         shell: bash
@@ -333,7 +332,7 @@ jobs:
           echo "Cloudflare Tunnel process started."
 
       # --------------------------------------------------
-      # 10. Start DSH Web
+      # 11. Start DSH Web
       # --------------------------------------------------
       - name: Start DSH Web
         id: start-dsh
@@ -427,7 +426,7 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 11. Push access URL to WeChat
+      # 12. Push access URL to WeChat
       # --------------------------------------------------
       - name: Push DSH URL to WeChat
         if: steps.start-dsh.outputs.has_token == 'true'
@@ -482,7 +481,7 @@ jobs:
           echo "WeChat notification request completed."
 
       # --------------------------------------------------
-      # 12. Keep alive and periodic backup
+      # 13. Keep alive and periodic backup
       # --------------------------------------------------
       - name: Keep alive and periodic backup
         shell: bash
@@ -541,7 +540,7 @@ jobs:
           echo "Maximum runtime reached."
 
       # --------------------------------------------------
-      # 13. Final backup
+      # 14. Final backup
       # --------------------------------------------------
       - name: Final persistent data backup
         if: always() && steps.restore.outputs.restored == 'true'
@@ -559,7 +558,7 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 14. Show status
+      # 15. Show status
       # --------------------------------------------------
       - name: Show DSH status
         if: always()
