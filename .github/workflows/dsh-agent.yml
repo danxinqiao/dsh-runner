@@ -80,7 +80,7 @@ jobs:
           cloudflared --version
 
       # --------------------------------------------------
-      # 6. Restore persistent DSH data and workspaces
+      # 6. Restore DSH data and workspaces
       # --------------------------------------------------
       - name: Restore persistent data
         id: restore
@@ -99,7 +99,8 @@ jobs:
 
           mkdir -p "$HOME/.dsh"
 
-          # Detect DSH data directory.
+          # Restore DSH home data. This includes sessions, attachments,
+          # storage records, profiles, and other DSH home files.
           SOURCE_DIR=""
 
           if [ -d "$PRIVATE_DIR/dsh-data" ]; then
@@ -118,7 +119,6 @@ jobs:
               "$HOME/.dsh/"
 
             echo "DSH data restored."
-
           else
             if [ "$ALLOW_EMPTY_BOOTSTRAP" != "true" ]; then
               echo "ERROR: No DSH data directory found."
@@ -131,18 +131,41 @@ jobs:
             mkdir -p "$PRIVATE_DIR/dsh-data"
           fi
 
-          # Restore workspaces.
-          if [ -d "$PRIVATE_DIR/workspaces" ]; then
+          # Resolve the Documents directory used by DSH's default workspace.
+          DOCUMENTS_DIR=""
+          if command -v xdg-user-dir >/dev/null 2>&1; then
+            DOCUMENTS_DIR="$(xdg-user-dir DOCUMENTS 2>/dev/null || true)"
+          fi
+          if [ -z "$DOCUMENTS_DIR" ]; then
+            DOCUMENTS_DIR="$HOME/Documents"
+          fi
 
-            echo "Restoring workspaces..."
+          DEFAULT_DSH_WORKSPACE="$DOCUMENTS_DIR/deepseek-harness/default-workspace"
+          DEFAULT_WORKSPACE_BACKUP="$PRIVATE_DIR/workspaces/__dsh_default_workspace"
+
+          # Restore DSH's default workspace when it has been backed up.
+          if [ -d "$DEFAULT_WORKSPACE_BACKUP" ]; then
+            echo "Restoring DSH default workspace to: $DEFAULT_DSH_WORKSPACE"
+
+            mkdir -p "$DEFAULT_DSH_WORKSPACE"
+
+            rsync -a \
+              "$DEFAULT_WORKSPACE_BACKUP/" \
+              "$DEFAULT_DSH_WORKSPACE/"
+          fi
+
+          # Restore existing custom workspaces using the workflow's
+          # established mapping: workspaces/<name> -> /home/runner/<name>.
+          if [ -d "$PRIVATE_DIR/workspaces" ]; then
+            echo "Restoring custom workspaces..."
 
             find "$PRIVATE_DIR/workspaces" \
               -mindepth 1 \
               -maxdepth 1 \
               -type d \
+              ! -name "__dsh_default_workspace" \
               -print0 |
             while IFS= read -r -d '' DIR; do
-
               NAME="$(basename "$DIR")"
 
               echo "Restoring workspace: $NAME"
@@ -152,14 +175,12 @@ jobs:
               rsync -a \
                 "$DIR/" \
                 "/home/runner/$NAME/"
-
             done
-
           else
             echo "No previous workspaces found."
           fi
 
-          # Fix permissions.
+          # Fix permissions on DSH home and credentials.
           chmod 700 "$HOME/.dsh"
 
           if [ -f "$HOME/.dsh/.credentials.yaml" ]; then
@@ -207,45 +228,68 @@ jobs:
           mkdir -p "$PRIVATE_DIR/dsh-data"
           mkdir -p "$PRIVATE_DIR/workspaces"
 
-          # Backup DSH data.
+          # Back up the entire DSH home so conversation history,
+          # attachments, storage records, profiles, and configuration persist.
           if [ -d "$DSH_DIR" ]; then
             rsync -a --delete \
               "$DSH_DIR/" \
               "$PRIVATE_DIR/dsh-data/"
           fi
 
-          # Backup workspaces.
-          for DIR in /home/runner/*; do
+          # Resolve the Documents directory used by DSH's default workspace.
+          DOCUMENTS_DIR=""
+          if command -v xdg-user-dir >/dev/null 2>&1; then
+            DOCUMENTS_DIR="$(xdg-user-dir DOCUMENTS 2>/dev/null || true)"
+          fi
+          if [ -z "$DOCUMENTS_DIR" ]; then
+            DOCUMENTS_DIR="$HOME/Documents"
+          fi
 
-            [ -d "$DIR" ] || continue
+          DEFAULT_DSH_WORKSPACE="$DOCUMENTS_DIR/deepseek-harness/default-workspace"
+          DEFAULT_WORKSPACE_BACKUP="$PRIVATE_DIR/workspaces/__dsh_default_workspace"
 
-            NAME="$(basename "$DIR")"
+          # Back up the DSH default workspace if it exists.
+          if [ -d "$DEFAULT_DSH_WORKSPACE" ]; then
+            mkdir -p "$DEFAULT_WORKSPACE_BACKUP"
 
-            case "$NAME" in
-              actions-runner|work|_work|hostedtoolcache|toolcache)
-                continue
-                ;;
-            esac
+            echo "Backing up DSH default workspace..."
 
-            mkdir -p "$PRIVATE_DIR/workspaces/$NAME"
+            rsync -a --delete \
+              "$DEFAULT_DSH_WORKSPACE/" \
+              "$DEFAULT_WORKSPACE_BACKUP/"
+          fi
+
+          # Back up only custom workspaces already represented in the
+          # private repository. This avoids scanning unrelated runner folders.
+          for WORKSPACE_BACKUP in "$PRIVATE_DIR"/workspaces/*; do
+            [ -d "$WORKSPACE_BACKUP" ] || continue
+
+            NAME="$(basename "$WORKSPACE_BACKUP")"
+
+            if [ "$NAME" = "__dsh_default_workspace" ]; then
+              continue
+            fi
+
+            WORKSPACE_SOURCE="/home/runner/$NAME"
+
+            if [ ! -d "$WORKSPACE_SOURCE" ]; then
+              echo "Workspace not present on runner; skipping: $NAME"
+              continue
+            fi
 
             echo "Backing up workspace: $NAME"
 
             rsync -a --delete \
-              "$DIR/" \
-              "$PRIVATE_DIR/workspaces/$NAME/"
-
+              "$WORKSPACE_SOURCE/" \
+              "$WORKSPACE_BACKUP/"
           done
 
-          # Commit only DSH data and workspaces.
+          # Commit only DSH home data and explicitly managed workspaces.
           git -C "$PRIVATE_DIR" add -A -- dsh-data workspaces
 
           if git -C "$PRIVATE_DIR" diff --cached --quiet; then
-
             echo "No changes detected."
-
           else
-
             git -C "$PRIVATE_DIR" commit \
               -m "DSH backup $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
@@ -253,7 +297,6 @@ jobs:
             PUSH_SUCCESS=false
 
             for ATTEMPT in 1 2 3; do
-
               echo "Git push attempt: $ATTEMPT"
 
               if git -C "$PRIVATE_DIR" push origin HEAD; then
@@ -272,14 +315,12 @@ jobs:
                 echo "Rebase failed."
                 break
               fi
-
             done
 
             if [ "$PUSH_SUCCESS" != "true" ]; then
               echo "ERROR: Could not push backup to private repository."
               exit 1
             fi
-
           fi
 
           echo "Backup completed."
@@ -353,7 +394,6 @@ jobs:
           READY=false
 
           for i in $(seq 1 60); do
-
             HTTP_CODE=$(
               curl -sS \
                 -o /dev/null \
@@ -372,7 +412,6 @@ jobs:
             esac
 
             sleep 1
-
           done
 
           if [ "$READY" != "true" ]; then
@@ -391,7 +430,6 @@ jobs:
           )
 
           if [ -n "$RAW_TOKEN_URL" ]; then
-
             TOKEN_STR=$(
               echo "$RAW_TOKEN_URL" |
               sed -E 's/.*token=([a-zA-Z0-9_-]+).*/\1/'
@@ -403,17 +441,12 @@ jobs:
             echo "::add-mask::$TOKEN_URL"
 
             echo "TOKEN_URL=$TOKEN_URL" >> "$GITHUB_ENV"
-
             echo "has_token=true" >> "$GITHUB_OUTPUT"
 
             echo "DSH access token extracted."
-
           else
-
             echo "has_token=false" >> "$GITHUB_OUTPUT"
-
             echo "WARNING: Token not found."
-
           fi
 
       # --------------------------------------------------
@@ -498,7 +531,6 @@ jobs:
           MAX_RUNTIME=$((300 * 60))
 
           while (( SECONDS - START_TIME < MAX_RUNTIME )); do
-
             # Check DSH process.
             if ! kill -0 "$(cat dsh-web.pid)" 2>/dev/null; then
               echo "ERROR: DSH Web process has stopped."
@@ -515,17 +547,14 @@ jobs:
 
             # Periodic backup.
             if (( SECONDS - LAST_BACKUP >= BACKUP_INTERVAL )); then
-
               echo "Periodic backup triggered."
 
               "$BACKUP_SCRIPT"
 
               LAST_BACKUP=$SECONDS
-
             fi
 
             sleep 30
-
           done
 
           echo "Maximum runtime reached."
