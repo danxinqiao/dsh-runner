@@ -15,6 +15,7 @@ env:
   BACKUP_INTERVAL: "600"
   PRIVATE_DATA_DIR: "private-data"
   ALLOW_EMPTY_BOOTSTRAP: "true"
+  SUPABASE_S3_MOUNT: "/mnt/dsh-supabase-s3"
 
 jobs:
   run-dsh-web:
@@ -80,7 +81,20 @@ jobs:
           cloudflared --version
 
       # --------------------------------------------------
-      # 6. Restore DSH data and workspaces
+      # 6. Install rclone and FUSE for the Supabase S3 mount
+      # --------------------------------------------------
+      - name: Install rclone and FUSE
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y rclone fuse3
+
+          rclone version
+
+      # --------------------------------------------------
+      # 7. Restore DSH data and workspaces
       # --------------------------------------------------
       - name: Restore persistent data
         id: restore
@@ -99,8 +113,7 @@ jobs:
 
           mkdir -p "$HOME/.dsh"
 
-          # Restore DSH home data. This includes sessions, attachments,
-          # storage records, profiles, and other DSH home files.
+          # Restore DSH home data.
           SOURCE_DIR=""
 
           if [ -d "$PRIVATE_DIR/dsh-data" ]; then
@@ -154,8 +167,8 @@ jobs:
               "$DEFAULT_DSH_WORKSPACE/"
           fi
 
-          # Restore existing custom workspaces using the workflow's
-          # established mapping: workspaces/<name> -> /home/runner/<name>.
+          # Restore custom workspaces using the existing mapping:
+          # workspaces/<name> -> /home/runner/<name>.
           if [ -d "$PRIVATE_DIR/workspaces" ]; then
             echo "Restoring custom workspaces..."
 
@@ -192,7 +205,7 @@ jobs:
           echo "Persistent data restoration completed."
 
       # --------------------------------------------------
-      # 7. Configure Git for automatic backup
+      # 8. Configure Git for automatic backup
       # --------------------------------------------------
       - name: Configure backup Git
         shell: bash
@@ -206,7 +219,7 @@ jobs:
           echo "Private data repository configured."
 
       # --------------------------------------------------
-      # 8. Create backup script
+      # 9. Create backup script
       # --------------------------------------------------
       - name: Create backup script
         shell: bash
@@ -228,8 +241,7 @@ jobs:
           mkdir -p "$PRIVATE_DIR/dsh-data"
           mkdir -p "$PRIVATE_DIR/workspaces"
 
-          # Back up the entire DSH home so conversation history,
-          # attachments, storage records, profiles, and configuration persist.
+          # Back up DSH home data.
           if [ -d "$DSH_DIR" ]; then
             rsync -a --delete \
               "$DSH_DIR/" \
@@ -248,7 +260,7 @@ jobs:
           DEFAULT_DSH_WORKSPACE="$DOCUMENTS_DIR/deepseek-harness/default-workspace"
           DEFAULT_WORKSPACE_BACKUP="$PRIVATE_DIR/workspaces/__dsh_default_workspace"
 
-          # Back up the DSH default workspace if it exists.
+          # Back up DSH's default workspace if it exists.
           if [ -d "$DEFAULT_DSH_WORKSPACE" ]; then
             mkdir -p "$DEFAULT_WORKSPACE_BACKUP"
 
@@ -260,7 +272,7 @@ jobs:
           fi
 
           # Back up only custom workspaces already represented in the
-          # private repository. This avoids scanning unrelated runner folders.
+          # private repository.
           for WORKSPACE_BACKUP in "$PRIVATE_DIR"/workspaces/*; do
             [ -d "$WORKSPACE_BACKUP" ] || continue
 
@@ -284,7 +296,8 @@ jobs:
               "$WORKSPACE_BACKUP/"
           done
 
-          # Commit only DSH home data and explicitly managed workspaces.
+          # Only these two paths are staged. The S3 mount is at /mnt,
+          # outside private-data and outside all configured workspace paths.
           git -C "$PRIVATE_DIR" add -A -- dsh-data workspaces
 
           if git -C "$PRIVATE_DIR" diff --cached --quiet; then
@@ -329,7 +342,81 @@ jobs:
           chmod +x "$RUNNER_TEMP/dsh-backup.sh"
 
       # --------------------------------------------------
-      # 9. Start Cloudflare Named Tunnel
+      # 10. Mount Supabase S3 bucket as a local filesystem path
+      # --------------------------------------------------
+      - name: Mount Supabase S3 bucket
+        shell: bash
+        env:
+          SUPABASE_S3_ENDPOINT: ${{ vars.SUPABASE_S3_ENDPOINT }}
+          SUPABASE_S3_REGION: ${{ vars.SUPABASE_S3_REGION }}
+          SUPABASE_S3_BUCKET: ${{ vars.SUPABASE_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          for REQUIRED_VAR in \
+            SUPABASE_S3_ENDPOINT \
+            SUPABASE_S3_REGION \
+            SUPABASE_S3_BUCKET \
+            AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!REQUIRED_VAR:-}" ]; then
+              echo "ERROR: Required Supabase S3 setting is missing: $REQUIRED_VAR"
+              exit 1
+            fi
+          done
+
+          MOUNT_DIR="$SUPABASE_S3_MOUNT"
+          RCLONE_CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          CACHE_DIR="$RUNNER_TEMP/rclone-cache"
+
+          sudo mkdir -p "$MOUNT_DIR"
+          sudo chown "$(id -u):$(id -g)" "$MOUNT_DIR"
+          mkdir -p "$CACHE_DIR"
+          chmod 700 "$MOUNT_DIR" "$CACHE_DIR"
+
+          # Store only non-secret connection settings in the config.
+          # Credentials are read from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY.
+          rclone --config "$RCLONE_CONFIG_FILE" config create supabase s3 \
+            provider Other \
+            env_auth true \
+            endpoint "$SUPABASE_S3_ENDPOINT" \
+            region "$SUPABASE_S3_REGION"
+
+          chmod 600 "$RCLONE_CONFIG_FILE"
+
+          rclone --config "$RCLONE_CONFIG_FILE" mount \
+            "supabase:${SUPABASE_S3_BUCKET}" \
+            "$MOUNT_DIR" \
+            --daemon \
+            --vfs-cache-mode writes \
+            --cache-dir "$CACHE_DIR" \
+            --dir-cache-time 30s \
+            --log-file "$RUNNER_TEMP/rclone-mount.log" \
+            --log-level INFO
+
+          MOUNT_READY=false
+          for _ in $(seq 1 30); do
+            if mountpoint -q "$MOUNT_DIR"; then
+              MOUNT_READY=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$MOUNT_READY" != "true" ]; then
+            echo "ERROR: Supabase S3 mount did not become ready."
+            cat "$RUNNER_TEMP/rclone-mount.log" || true
+            exit 1
+          fi
+
+          echo "Supabase S3 bucket mounted at: $MOUNT_DIR"
+          echo "DSH can access bucket objects as files under this path."
+
+      # --------------------------------------------------
+      # 11. Start Cloudflare Named Tunnel
       # --------------------------------------------------
       - name: Start Cloudflare Tunnel
         shell: bash
@@ -364,7 +451,7 @@ jobs:
           echo "Cloudflare Tunnel process started."
 
       # --------------------------------------------------
-      # 10. Start DSH Web
+      # 12. Start DSH Web
       # --------------------------------------------------
       - name: Start DSH Web
         id: start-dsh
@@ -380,6 +467,7 @@ jobs:
           PUBLIC_HOST="${PUBLIC_HOST%/}"
 
           echo "Starting DSH Web..."
+          echo "Supabase S3 path: $SUPABASE_S3_MOUNT"
 
           setsid dsh web \
             --public-url "$CUSTOM_DOMAIN" \
@@ -450,7 +538,7 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 11. Push access URL to WeChat
+      # 13. Push access URL to WeChat
       # --------------------------------------------------
       - name: Push DSH URL to WeChat
         if: steps.start-dsh.outputs.has_token == 'true'
@@ -505,7 +593,7 @@ jobs:
           echo "WeChat notification request completed."
 
       # --------------------------------------------------
-      # 12. Keep alive and periodic backup
+      # 14. Keep alive and periodic backup
       # --------------------------------------------------
       - name: Keep alive and periodic backup
         shell: bash
@@ -560,7 +648,7 @@ jobs:
           echo "Maximum runtime reached."
 
       # --------------------------------------------------
-      # 13. Final backup
+      # 15. Final backup
       # --------------------------------------------------
       - name: Final persistent data backup
         if: always() && steps.restore.outputs.restored == 'true'
@@ -578,7 +666,24 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 14. Show status
+      # 16. Unmount Supabase S3
+      # --------------------------------------------------
+      - name: Unmount Supabase S3 bucket
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if mountpoint -q "$SUPABASE_S3_MOUNT"; then
+            fusermount3 -u "$SUPABASE_S3_MOUNT" \
+              || fusermount -u "$SUPABASE_S3_MOUNT" \
+              || true
+          fi
+
+          rm -f "$RUNNER_TEMP/rclone.conf"
+
+      # --------------------------------------------------
+      # 17. Show status
       # --------------------------------------------------
       - name: Show DSH status
         if: always()
