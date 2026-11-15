@@ -368,22 +368,57 @@ jobs:
 
           R2_SETUP_DIR="$CLOUDFLARE_R2_MOUNT/dsh/setup-pnpm"
           LOCAL_SETUP_DIR="$RUNNER_TEMP/setup-pnpm"
-          PNPM_SHIM="$LOCAL_SETUP_DIR/node_modules/.bin/pnpm"
           DSH_BIN_DIR="$RUNNER_TEMP/dsh-bin"
+
+          echo "Checking R2 pnpm source..."
+          if [ ! -d "$R2_SETUP_DIR" ]; then
+            echo "ERROR: R2 pnpm directory not found:"
+            echo "  $R2_SETUP_DIR"
+            exit 1
+          fi
 
           if [ ! -f "$R2_SETUP_DIR/node_modules/.bin/pnpm" ]; then
             echo "ERROR: pnpm launcher not found in R2:"
             echo "  $R2_SETUP_DIR/node_modules/.bin/pnpm"
+            ls -la "$R2_SETUP_DIR" || true
+            ls -la "$R2_SETUP_DIR/node_modules" || true
+            ls -la "$R2_SETUP_DIR/node_modules/.bin" || true
             exit 1
           fi
 
-          # Copy the whole setup-pnpm directory so the .bin launcher can
-          # resolve the pnpm package under node_modules/.pnpm.
-          mkdir -p "$LOCAL_SETUP_DIR" "$DSH_BIN_DIR"
-          cp -a "$R2_SETUP_DIR/." "$LOCAL_SETUP_DIR/"
-          chmod +x "$PNPM_SHIM"
+          mountpoint -q "$CLOUDFLARE_R2_MOUNT" || {
+            echo "ERROR: Cloudflare R2 mount is not active."
+            exit 1
+          }
 
-          echo "Checking pnpm from the copied R2 files..."
+          mkdir -p "$LOCAL_SETUP_DIR" "$DSH_BIN_DIR"
+
+          # Important: avoid `cp -a` here.
+          # FUSE/Rclone-mounted filesystems may fail on preserving permissions
+          # with "Input/output error". We only need a working local pnpm bundle.
+          if ! cp -R "$R2_SETUP_DIR" "$LOCAL_SETUP_DIR/"; then
+            echo "cp -R failed. Trying tar fallback..."
+            rm -rf "$LOCAL_SETUP_DIR"
+            mkdir -p "$LOCAL_SETUP_DIR"
+            tar -C "$R2_SETUP_DIR" -cf - . | tar -C "$LOCAL_SETUP_DIR" -xf -
+          fi
+
+          PNPM_SHIM="$LOCAL_SETUP_DIR/setup-pnpm/node_modules/.bin/pnpm"
+          if [ ! -f "$PNPM_SHIM" ]; then
+            PNPM_SHIM="$LOCAL_SETUP_DIR/node_modules/.bin/pnpm"
+          fi
+
+          if [ ! -f "$PNPM_SHIM" ]; then
+            echo "ERROR: pnpm shim not found after copy."
+            echo "Local setup dir:"
+            find "$LOCAL_SETUP_DIR" -maxdepth 4 -type f | head -200 || true
+            exit 1
+          fi
+
+          chmod +x "$PNPM_SHIM"
+          find "$LOCAL_SETUP_DIR" -type f -path '*/.bin/*' -exec chmod +x {} \; 2>/dev/null || true
+
+          echo "Checking pnpm from local copy..."
           "$PNPM_SHIM" --version
 
           # Configure pnpm's global package and command locations.
