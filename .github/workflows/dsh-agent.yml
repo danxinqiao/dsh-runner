@@ -359,77 +359,55 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 11. Copy pnpm from R2 and install DSH with pnpm
+      # 11. Download pnpm 12.18.0 from GitHub Releases and install DSH
       # --------------------------------------------------
-      - name: Install DSH with pnpm from R2
+      - name: Install pnpm and DSH
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          R2_SETUP_DIR="$CLOUDFLARE_R2_MOUNT/dsh/setup-pnpm"
-          LOCAL_SETUP_DIR="$RUNNER_TEMP/setup-pnpm"
+          PNPM_VERSION="12.18.0"
+          PNPM_PREFIX="$RUNNER_TEMP/pnpm-install"
+          PNPM_BIN="$PNPM_PREFIX/bin/pnpm"
+          PNPM_ARCHIVE="$RUNNER_TEMP/pnpm-linux-x64.tar.gz"
+          PNPM_EXTRACT_DIR="$RUNNER_TEMP/pnpm-release"
           DSH_BIN_DIR="$RUNNER_TEMP/dsh-bin"
 
-          echo "Checking R2 pnpm source..."
-          if [ ! -d "$R2_SETUP_DIR" ]; then
-            echo "ERROR: R2 pnpm directory not found:"
-            echo "  $R2_SETUP_DIR"
+          # Download the official Linux x64 standalone archive directly from
+          # the pnpm GitHub Release. Everything is kept under RUNNER_TEMP and
+          # is not copied into the private data repository.
+          mkdir -p "$PNPM_PREFIX/bin" "$PNPM_EXTRACT_DIR" "$DSH_BIN_DIR"
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-x64.tar.gz" \
+            --output "$PNPM_ARCHIVE"
+
+          tar -xzf "$PNPM_ARCHIVE" -C "$PNPM_EXTRACT_DIR"
+          RELEASE_PNPM="$(find "$PNPM_EXTRACT_DIR" -type f -name pnpm -print -quit)"
+          if [ -z "$RELEASE_PNPM" ]; then
+            echo "ERROR: pnpm executable was not found in the GitHub release archive."
+            echo "Archive contents:"
+            find "$PNPM_EXTRACT_DIR" -maxdepth 4 -type f -print || true
             exit 1
           fi
 
-          if [ ! -f "$R2_SETUP_DIR/node_modules/.bin/pnpm" ]; then
-            echo "ERROR: pnpm launcher not found in R2:"
-            echo "  $R2_SETUP_DIR/node_modules/.bin/pnpm"
-            ls -la "$R2_SETUP_DIR" || true
-            ls -la "$R2_SETUP_DIR/node_modules" || true
-            ls -la "$R2_SETUP_DIR/node_modules/.bin" || true
+          install -m 0755 "$RELEASE_PNPM" "$PNPM_BIN"
+          rm -rf "$PNPM_EXTRACT_DIR" "$PNPM_ARCHIVE"
+
+          ACTUAL_PNPM_VERSION="$("$PNPM_BIN" --version)"
+          echo "Installed pnpm version: $ACTUAL_PNPM_VERSION"
+          if [ "$ACTUAL_PNPM_VERSION" != "$PNPM_VERSION" ]; then
+            echo "ERROR: Expected pnpm $PNPM_VERSION, got $ACTUAL_PNPM_VERSION"
             exit 1
           fi
 
-          mountpoint -q "$CLOUDFLARE_R2_MOUNT" || {
-            echo "ERROR: Cloudflare R2 mount is not active."
-            exit 1
-          }
+          # Keep pnpm global packages and executable links in runner temp too.
+          "$PNPM_BIN" config set global-dir "$RUNNER_TEMP/pnpm-global"
+          "$PNPM_BIN" config set global-bin-dir "$DSH_BIN_DIR"
 
-          mkdir -p "$LOCAL_SETUP_DIR" "$DSH_BIN_DIR"
-
-          # Important: avoid `cp -a` here.
-          # FUSE/Rclone-mounted filesystems may fail on preserving permissions
-          # with "Input/output error". We only need a working local pnpm bundle.
-          if ! cp -R "$R2_SETUP_DIR" "$LOCAL_SETUP_DIR/"; then
-            echo "cp -R failed. Trying tar fallback..."
-            rm -rf "$LOCAL_SETUP_DIR"
-            mkdir -p "$LOCAL_SETUP_DIR"
-            tar -C "$R2_SETUP_DIR" -cf - . | tar -C "$LOCAL_SETUP_DIR" -xf -
-          fi
-
-          PNPM_SHIM="$LOCAL_SETUP_DIR/setup-pnpm/node_modules/.bin/pnpm"
-          if [ ! -f "$PNPM_SHIM" ]; then
-            PNPM_SHIM="$LOCAL_SETUP_DIR/node_modules/.bin/pnpm"
-          fi
-
-          if [ ! -f "$PNPM_SHIM" ]; then
-            echo "ERROR: pnpm shim not found after copy."
-            echo "Local setup dir:"
-            find "$LOCAL_SETUP_DIR" -maxdepth 4 -type f | head -200 || true
-            exit 1
-          fi
-
-          chmod +x "$PNPM_SHIM"
-          find "$LOCAL_SETUP_DIR" -type f -path '*/.bin/*' -exec chmod +x {} \; 2>/dev/null || true
-
-          echo "Checking pnpm from local copy..."
-          "$PNPM_SHIM" --version
-
-          # Configure pnpm's global package and command locations.
-          "$PNPM_SHIM" config set global-dir "$RUNNER_TEMP/pnpm-global"
-          "$PNPM_SHIM" config set global-bin-dir "$DSH_BIN_DIR"
-
-          # Make the dsh command available in this step and later steps.
           echo "$DSH_BIN_DIR" >> "$GITHUB_PATH"
           export PATH="$DSH_BIN_DIR:$PATH"
 
-          "$PNPM_SHIM" add --global @deepseek-ai/dsh@alpha
+          "$PNPM_BIN" add --global @deepseek-ai/dsh@alpha
 
           echo "DSH version:"
           dsh --version
