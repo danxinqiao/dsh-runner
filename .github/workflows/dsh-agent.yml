@@ -51,18 +51,7 @@ jobs:
           package-manager-cache: false
 
       # --------------------------------------------------
-      # 4. Install DSH
-      # --------------------------------------------------
-      - name: Install DSH
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          npm install -g @deepseek-ai/dsh@alpha
-          echo "DSH version:"
-          dsh --version
-
-      # --------------------------------------------------
-      # 5. Install Cloudflare Tunnel
+      # 4. Install Cloudflare Tunnel
       # --------------------------------------------------
       - name: Install cloudflared
         shell: bash
@@ -76,7 +65,7 @@ jobs:
           cloudflared --version
 
       # --------------------------------------------------
-      # 6. Install rclone and FUSE for S3-compatible mounts
+      # 5. Install rclone and FUSE for S3-compatible mounts
       # --------------------------------------------------
       - name: Install rclone and FUSE
         shell: bash
@@ -87,7 +76,7 @@ jobs:
           rclone version
 
       # --------------------------------------------------
-      # 7. Restore DSH data and workspaces
+      # 6. Restore DSH data and workspaces
       # --------------------------------------------------
       - name: Restore persistent data
         id: restore
@@ -164,7 +153,7 @@ jobs:
           echo "Persistent data restoration completed."
 
       # --------------------------------------------------
-      # 8. Configure Git for automatic backup
+      # 7. Configure Git for automatic backup
       # --------------------------------------------------
       - name: Configure backup Git
         shell: bash
@@ -176,7 +165,7 @@ jobs:
           echo "Private data repository configured."
 
       # --------------------------------------------------
-      # 9. Create backup script
+      # 8. Create backup script
       # --------------------------------------------------
       - name: Create backup script
         shell: bash
@@ -264,7 +253,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/dsh-backup.sh"
 
       # --------------------------------------------------
-      # 10. Mount Supabase S3 bucket as a local filesystem path
+      # 9. Mount Supabase S3 bucket as a local filesystem path
       # --------------------------------------------------
       - name: Mount Supabase S3 bucket
         shell: bash
@@ -317,7 +306,7 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 11. Mount Cloudflare R2 bucket as a separate local filesystem path
+      # 10. Mount Cloudflare R2 bucket as a separate local filesystem path
       # --------------------------------------------------
       - name: Mount Cloudflare R2 bucket
         shell: bash
@@ -368,6 +357,47 @@ jobs:
             cat "$RUNNER_TEMP/rclone-cloudflare-r2.log" || true
             exit 1
           fi
+
+      # --------------------------------------------------
+      # 11. Copy pnpm from R2 and install DSH with pnpm
+      # --------------------------------------------------
+      - name: Install DSH with pnpm from R2
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          R2_SETUP_DIR="$CLOUDFLARE_R2_MOUNT/dsh/setup-pnpm"
+          LOCAL_SETUP_DIR="$RUNNER_TEMP/setup-pnpm"
+          PNPM_SHIM="$LOCAL_SETUP_DIR/node_modules/.bin/pnpm"
+          DSH_BIN_DIR="$RUNNER_TEMP/dsh-bin"
+
+          if [ ! -f "$R2_SETUP_DIR/node_modules/.bin/pnpm" ]; then
+            echo "ERROR: pnpm launcher not found in R2:"
+            echo "  $R2_SETUP_DIR/node_modules/.bin/pnpm"
+            exit 1
+          fi
+
+          # Copy the whole setup-pnpm directory so the .bin launcher can
+          # resolve the pnpm package under node_modules/.pnpm.
+          mkdir -p "$LOCAL_SETUP_DIR" "$DSH_BIN_DIR"
+          cp -a "$R2_SETUP_DIR/." "$LOCAL_SETUP_DIR/"
+          chmod +x "$PNPM_SHIM"
+
+          echo "Checking pnpm from the copied R2 files..."
+          "$PNPM_SHIM" --version
+
+          # Configure pnpm's global package and command locations.
+          "$PNPM_SHIM" config set global-dir "$RUNNER_TEMP/pnpm-global"
+          "$PNPM_SHIM" config set global-bin-dir "$DSH_BIN_DIR"
+
+          # Make the dsh command available in this step and later steps.
+          echo "$DSH_BIN_DIR" >> "$GITHUB_PATH"
+          export PATH="$DSH_BIN_DIR:$PATH"
+
+          "$PNPM_SHIM" add --global @deepseek-ai/dsh@alpha
+
+          echo "DSH version:"
+          dsh --version
 
       # --------------------------------------------------
       # 12. Start Cloudflare Named Tunnel
