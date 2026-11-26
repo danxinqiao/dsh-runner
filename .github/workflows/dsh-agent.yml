@@ -407,7 +407,8 @@ jobs:
           echo "$DSH_BIN_DIR" >> "$GITHUB_PATH"
           export PATH="$DSH_BIN_DIR:$PATH"
 
-          "$PNPM_BIN" add --global @deepseek-ai/dsh@alpha
+          # "$PNPM_BIN" add --global @deepseek-ai/dsh@alpha
+          "$PNPM_BIN" add --global @deepseek-ai/dsh@0.2.2-rc.2
 
           echo "DSH version:"
           dsh --version
