@@ -451,13 +451,33 @@ jobs:
           DSH_WEB_AUTH_PASSWORD: ${{ secrets.DSH_WEB_AUTH_PASSWORD }}
         run: |
           set -Eeuo pipefail
+
           PUBLIC_HOST="${CUSTOM_DOMAIN#https://}"
           PUBLIC_HOST="${PUBLIC_HOST#http://}"
           PUBLIC_HOST="${PUBLIC_HOST%/}"
 
+          echo "===== DSH runtime diagnostics ====="
+          echo "Node.js: $(node --version)"
+          echo "DSH executable: $(command -v dsh)"
+          echo "DSH executable target: $(readlink -f "$(command -v dsh)")"
+          echo "DSH version:"
+          dsh --version
+          echo "DSH home: $HOME/.dsh"
+          echo "DSH config file names (contents are not printed):"
+          if [ -d "$HOME/.dsh" ]; then
+            find "$HOME/.dsh" -maxdepth 2 -type f \
+              -printf '%P (%s bytes)\n' | sort
+          else
+            echo "$HOME/.dsh does not exist"
+          fi
+          echo "==================================="
+
           echo "Starting DSH Web..."
+          echo "Public URL: $CUSTOM_DOMAIN"
+          echo "Trusted host: $PUBLIC_HOST"
           echo "Supabase S3 path: $SUPABASE_S3_MOUNT"
           echo "Cloudflare R2 path: $CLOUDFLARE_R2_MOUNT"
+
           setsid dsh web \
             --public-url "$CUSTOM_DOMAIN" \
             --trusted-host "$PUBLIC_HOST" \
@@ -477,12 +497,22 @@ jobs:
                 break
                 ;;
             esac
+
+            if ! kill -0 "$(cat dsh-web.pid)" 2>/dev/null; then
+              echo "ERROR: DSH Web process exited while waiting for readiness."
+              echo "----- DSH Web startup log -----"
+              sed -E 's/([?&]token=)[A-Za-z0-9._~-]+/\1[REDACTED]/g' \
+                dsh-web.log | tail -200 || true
+              exit 1
+            fi
             sleep 1
           done
+
           if [ "$READY" != "true" ]; then
-            echo "ERROR: DSH Web failed to start."
-            echo "----- DSH Web logs -----"
-            tail -80 dsh-web.log || true
+            echo "ERROR: DSH Web failed to become ready."
+            echo "----- DSH Web startup log -----"
+            sed -E 's/([?&]token=)[A-Za-z0-9._~-]+/\1[REDACTED]/g' \
+              dsh-web.log | tail -200 || true
             exit 1
           fi
           echo "DSH Web is ready."
@@ -499,7 +529,7 @@ jobs:
             echo "DSH access token extracted."
           else
             echo "has_token=false" >> "$GITHUB_OUTPUT"
-            echo "WARNING: Token not found."
+            echo "WARNING: Token not found in startup log."
           fi
 
       # --------------------------------------------------
@@ -621,12 +651,35 @@ jobs:
           echo "======================================"
           echo "DSH Web workflow finished."
           echo "======================================"
-          echo "DSH Web log:"
+
           if [ -f dsh-web.log ]; then
-            tail -30 dsh-web.log
+            echo "----- DSH Web version -----"
+            dsh --version || true
+
+            echo "----- Matching gateway/catalog errors -----"
+            if grep -Ein \
+              'definition-unavailable|llm/listProviders|agentPresets/list|permissionPresets/catalog|gateway' \
+              dsh-web.log >/dev/null 2>&1; then
+              grep -Ein \
+                'definition-unavailable|llm/listProviders|agentPresets/list|permissionPresets/catalog|gateway' \
+                dsh-web.log |
+                sed -E 's/([?&]token=)[A-Za-z0-9._~-]+/\1[REDACTED]/g' |
+                tail -200
+            else
+              echo "No matching gateway/catalog errors found in dsh-web.log."
+            fi
+
+            echo "----- Last 100 DSH Web log lines -----"
+            sed -E 's/([?&]token=)[A-Za-z0-9._~-]+/\1[REDACTED]/g' \
+              dsh-web.log | tail -100
+          else
+            echo "dsh-web.log was not created."
           fi
-          echo "Cloudflare Tunnel log:"
+
+          echo "----- Cloudflare Tunnel log -----"
           if [ -f cloudflared.log ]; then
-            tail -20 cloudflared.log
+            tail -50 cloudflared.log
+          else
+            echo "cloudflared.log was not created."
           fi
           echo "======================================"
